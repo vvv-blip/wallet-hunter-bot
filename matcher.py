@@ -12,6 +12,7 @@ Method:
 """
 import os, time, json, math, requests
 from collections import defaultdict
+from datetime import datetime
 
 WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
 
@@ -30,6 +31,13 @@ ROUTERS = {a.lower() for a in [
     '0xb2ecfE4E4D61f8790bbb9DE2D1259B9e2410CEA5',  # ParaSwap
     '0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae',  # LI.FI Diamond
     '0x881D40237659C251811CEC9c364ef91dC08D300C',  # Metamask Swap
+    '0x74de5d4fcbf63e00296fd95d33236b9794016631',  # Banana Gun router
+    '0x1a0a18ac4becddbd6389559687d1a73d8927e416',  # Maestro router
+    '0xd1742b3c4fbb096990c8950fa635aec75b30781a',  # Maestro
+    '0x80a64c6d7f12c47b7c66c5b4e20e72bc1fcd5d9e',  # Maestro v2
+    '0x00000000009726632680fb29d3f7a9734e3010e2',  # Rainbow router
+    '0x881d4032abe4188e2237efcd27ab435e81fc6bb1',  # Metamask Swaps (alt)
+    '0xa69babef1ca67a37ffaf7a485dfff3382056e78c',  # Matcha fee wrapper
 ]}
 
 
@@ -156,115 +164,77 @@ class Matcher:
         self._cache_set(key, all_tx)
         return all_tx
 
-    # ---- main aggregation ----
-    def build_wallet_stats(self, token, origin_budget_seconds=25, origin_max_lookups=400):
-        pairs = self.get_pairs(token)
-        if not pairs:
+    # ---- GeckoTerminal data source: each trade already carries tx_from_address (the real EOA),
+    #      so router resolution isn't needed. Covers ~600 most-recent trades per pool.
+    def _gecko(self, path, params=None):
+        try:
+            r = requests.get(f'https://api.geckoterminal.com/api/v2/{path}', params=params or {}, timeout=20)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return {}
+
+    def _gecko_pools(self, token):
+        """Top WETH-paired pools on Ethereum for the token, sorted by reserve desc."""
+        key = f'gpools_{token.lower()}'
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        d = self._gecko(f'networks/eth/tokens/{token}/pools')
+        pools = []
+        for p in d.get('data') or []:
+            a = p.get('attributes') or {}
+            rel = (p.get('relationships') or {}).get('base_token', {}).get('data') or {}
+            try:
+                reserve = float(a.get('reserve_in_usd') or 0)
+            except Exception:
+                reserve = 0
+            pools.append({
+                'addr': (a.get('address') or '').lower(),
+                'name': a.get('name') or '',
+                'liquidity_usd': reserve,
+                'dex': (p.get('relationships', {}).get('dex', {}).get('data') or {}).get('id', ''),
+            })
+        # keep only WETH-paired (or WETH/-like named) pools
+        pools = [p for p in pools if 'WETH' in p['name'].upper() or 'ETH' in p['name'].upper()]
+        pools.sort(key=lambda x: -x['liquidity_usd'])
+        self._cache_set(key, pools)
+        return pools
+
+    def _gecko_trades(self, pool, max_pages=2):
+        """Up to 600 most-recent trades for a pool (Gecko caps at ~300/page, 2 pages)."""
+        key = f'gtrades_{pool.lower()}'
+        cached = self._cache_get(key)
+        if cached is not None:
+            return cached
+        all_trades = []
+        for page in range(1, max_pages + 1):
+            d = self._gecko(f'networks/eth/pools/{pool}/trades', {'page': page})
+            arr = d.get('data') or []
+            if not arr:
+                break
+            all_trades.extend(arr)
+            if len(arr) < 300:
+                break
+            time.sleep(0.3)  # gentle on the free tier
+        self._cache_set(key, all_trades)
+        return all_trades
+
+    def build_wallet_stats(self, token):
+        """Return {wallet: {eth_in, eth_out, n_buys, n_sells, buy_ts, sell_ts, ...}}, pools.
+        Uses GeckoTerminal's trades feed where `tx_from_address` is the real EOA signer —
+        no router resolution needed.
+        """
+        pools = self._gecko_pools(token)
+        if not pools:
+            # fall back to DexScreener pairs as the pool list
+            pools = [{'addr': p['addr'], 'name': 'WETH pair', 'liquidity_usd': p['liquidity_usd']}
+                     for p in self.get_pairs(token)]
+        if not pools:
             return {}, []
 
-        # Pass 1: collect raw trades (don't skip routers yet — we'll reassign them)
-        trades = []
-        for pair in pairs[:3]:  # cap at top-3 liquid pairs
-            pair_low = pair['addr']
-            tok_txs = self._tokentx_pair(token, pair_low)
-            weth_txs = self._tokentx_pair(WETH, pair_low)
-            if not tok_txs:
-                continue
-
-            weth_by_hash = defaultdict(list)
-            for w in weth_txs:
-                try:
-                    weth_by_hash[w['hash']].append({
-                        'to': w['to'].lower(),
-                        'from': w['from'].lower(),
-                        'value': int(w['value']) / 1e18,
-                    })
-                except Exception:
-                    continue
-
-            for t in tok_txs:
-                try:
-                    to_a = t['to'].lower()
-                    from_a = t['from'].lower()
-                    h = t['hash']
-                    blk = int(t['blockNumber'])
-                    ts = int(t.get('timeStamp', 0) or 0)
-                except Exception:
-                    continue
-
-                is_buy = (from_a == pair_low and to_a != pair_low)
-                is_sell = (to_a == pair_low and from_a != pair_low)
-                if not (is_buy or is_sell):
-                    continue
-
-                weth_evs = weth_by_hash.get(h, [])
-                eth_amt = 0.0
-                if is_buy:
-                    for w in weth_evs:
-                        if w['to'] == pair_low:
-                            eth_amt += w['value']
-                    wallet = to_a
-                else:
-                    for w in weth_evs:
-                        if w['from'] == pair_low:
-                            eth_amt += w['value']
-                    wallet = from_a
-
-                if wallet == pair_low:
-                    continue
-
-                trades.append({
-                    'wallet': wallet, 'is_buy': is_buy, 'eth': eth_amt,
-                    'hash': h, 'blk': blk, 'ts': ts,
-                })
-
-        # Pass 2: detect unknown router/aggregator contracts (wallets with both buys & sells
-        # that happen to have on-chain code) and re-attribute their trades to tx origins
-        per_wallet = defaultdict(lambda: {'buys': 0, 'sells': 0})
-        for tr in trades:
-            k = 'buys' if tr['is_buy'] else 'sells'
-            per_wallet[tr['wallet']][k] += 1
-
-        suspicious = set(ROUTERS)
-        # a real router handles many trades on BOTH sides; require at least ~8 total activity
-        # to avoid flagging a retail trader who did one buy and one sell as a router
-        router_candidates = [
-            w for w, a in per_wallet.items()
-            if w not in ROUTERS and a['buys'] > 0 and a['sells'] > 0
-            and (a['buys'] + a['sells']) >= 8
-        ]
-        router_candidates.sort(key=lambda w: -(per_wallet[w]['buys'] + per_wallet[w]['sells']))
-        for w in router_candidates[:40]:
-            if self._is_contract(w):
-                suspicious.add(w)
-
-        # Resolve tx origins for suspicious-wallet trades, bounded by time + count budget
-        if suspicious:
-            deadline = time.time() + origin_budget_seconds
-            lookups = 0
-            origin_by_hash = {}
-            reassigned = []
-            for tr in trades:
-                if tr['wallet'] not in suspicious:
-                    reassigned.append(tr)
-                    continue
-                h = tr['hash']
-                if h not in origin_by_hash:
-                    cached = self._cache_get(f'origin_{h}', ttl=86400 * 365)
-                    if cached is not None:
-                        origin_by_hash[h] = cached
-                    elif lookups < origin_max_lookups and time.time() < deadline:
-                        origin_by_hash[h] = self._get_tx_origin(h) or ''
-                        lookups += 1
-                    else:
-                        origin_by_hash[h] = ''
-                real = origin_by_hash[h]
-                if not real or real in suspicious or real == tr['wallet']:
-                    continue  # drop — couldn't resolve to an EOA
-                reassigned.append({**tr, 'wallet': real})
-            trades = reassigned
-
-        # Pass 3: aggregate per (final) wallet
+        weth = WETH.lower()
         stats = defaultdict(lambda: {
             'eth_in': 0.0, 'eth_out': 0.0,
             'n_buys': 0, 'n_sells': 0,
@@ -272,26 +242,60 @@ class Matcher:
             'last_buy_ts': 0, 'last_sell_ts': 0,
             'buy_ts': [], 'sell_ts': [],
         })
-        for tr in trades:
-            s = stats[tr['wallet']]
-            if tr['is_buy']:
-                s['eth_in'] += tr['eth']
-                s['n_buys'] += 1
-                s['buy_ts'].append(tr['ts'])
-                if tr['ts'] > s['last_buy_ts']:
-                    s['last_buy_ts'] = tr['ts']
-            else:
-                s['eth_out'] += tr['eth']
-                s['n_sells'] += 1
-                s['sell_ts'].append(tr['ts'])
-                if tr['ts'] > s['last_sell_ts']:
-                    s['last_sell_ts'] = tr['ts']
-            if s['first_block'] == 0 or tr['blk'] < s['first_block']:
-                s['first_block'] = tr['blk']
-            if tr['blk'] > s['last_block']:
-                s['last_block'] = tr['blk']
 
-        return dict(stats), pairs
+        for pool in pools[:3]:  # top 3 pools by liquidity
+            trades = self._gecko_trades(pool['addr'])
+            for t in trades:
+                a = t.get('attributes') or {}
+                wallet = (a.get('tx_from_address') or '').lower()
+                if not wallet or wallet in ROUTERS:
+                    continue
+                kind = a.get('kind')
+                from_tok = (a.get('from_token_address') or '').lower()
+                to_tok = (a.get('to_token_address') or '').lower()
+                try:
+                    from_amt = float(a.get('from_token_amount') or 0)
+                    to_amt = float(a.get('to_token_amount') or 0)
+                    blk = int(a.get('block_number') or 0)
+                except Exception:
+                    continue
+                ts_str = a.get('block_timestamp') or ''
+                ts = 0
+                if ts_str:
+                    try:
+                        ts = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+                    except Exception:
+                        ts = 0
+
+                # Determine ETH amount for this trade (only count WETH-paired trades)
+                if kind == 'buy' and from_tok == weth:
+                    eth_amt = from_amt
+                    is_buy = True
+                elif kind == 'sell' and to_tok == weth:
+                    eth_amt = to_amt
+                    is_buy = False
+                else:
+                    continue  # non-ETH-denominated leg, skip
+
+                s = stats[wallet]
+                if is_buy:
+                    s['eth_in'] += eth_amt
+                    s['n_buys'] += 1
+                    s['buy_ts'].append(ts)
+                    if ts > s['last_buy_ts']:
+                        s['last_buy_ts'] = ts
+                else:
+                    s['eth_out'] += eth_amt
+                    s['n_sells'] += 1
+                    s['sell_ts'].append(ts)
+                    if ts > s['last_sell_ts']:
+                        s['last_sell_ts'] = ts
+                if s['first_block'] == 0 or (blk and blk < s['first_block']):
+                    s['first_block'] = blk
+                if blk > s['last_block']:
+                    s['last_block'] = blk
+
+        return dict(stats), pools
 
     def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):
         """Return wallets that bought in [min_buy_ts, max_buy_ts] AND sold in [min_sell_ts,
