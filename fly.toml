@@ -1,0 +1,29 @@
+# Fly.io config for the Wallet Hunter Telegram bot.
+# Deploy:
+#   1) curl -L https://fly.io/install.sh | sh
+#   2) flyctl auth signup   # or: flyctl auth login
+#   3) flyctl launch --no-deploy --copy-config --name wallet-hunter-bot
+#      (accept defaults; it'll ask you to pick a region)
+#   4) flyctl secrets set TELEGRAM_BOT_TOKEN=... ETHERSCAN_API_KEY=...
+#   5) flyctl volumes create bot_cache --size 1 --region <same-as-app>
+#   6) flyctl deploy
+#
+# One 256MB shared-cpu VM + 1GB volume fits inside the free hobby tier.
+
+app = "wallet-hunter-bot"          # change to a globally-unique name
+primary_region = "iad"             # change to nearest: ams, fra, lhr, sjc, syd, nrt
+
+[build]
+
+[[mounts]]
+  source = "bot_cache"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  cpus = 1
+
+# No public HTTP — bot uses Telegram long-polling outbound.
+[experimental]
+  auto_rollback = true

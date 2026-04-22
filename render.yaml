@@ -1,0 +1,30 @@
+# Render.com Blueprint — deploys the bot as a free Web Service.
+# The bot binds an HTTP health endpoint on $PORT so Render keeps it alive
+# as long as something (UptimeRobot) pings it every <15 min.
+#
+# Usage:
+#   1) Push this folder to a GitHub repo.
+#   2) render.com → New → Blueprint → connect repo → apply.
+#   3) In the service dashboard, set secrets:
+#        TELEGRAM_BOT_TOKEN = <from @BotFather>
+#        ETHERSCAN_API_KEY  = <etherscan.io/v2 key>
+#   4) Copy the public URL Render gives you (e.g. https://wallet-hunter-bot.onrender.com).
+#   5) UptimeRobot → Add New Monitor → HTTP(S) → that URL → 5-min interval.
+services:
+  - type: web
+    name: wallet-hunter-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false      # set manually in Render dashboard
+      - key: ETHERSCAN_API_KEY
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.12.5"
+      - key: BOT_CACHE_DIR
+        value: /tmp/cache
+    healthCheckPath: /
+    autoDeploy: true
