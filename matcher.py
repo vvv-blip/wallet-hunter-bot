@@ -157,7 +157,7 @@ class Matcher:
         return all_tx
 
     # ---- main aggregation ----
-    def build_wallet_stats(self, token, origin_budget_seconds=15, origin_max_lookups=200):
+    def build_wallet_stats(self, token, origin_budget_seconds=25, origin_max_lookups=400):
         pairs = self.get_pairs(token)
         if not pairs:
             return {}, []
@@ -226,13 +226,15 @@ class Matcher:
             per_wallet[tr['wallet']][k] += 1
 
         suspicious = set(ROUTERS)
+        # a real router handles many trades on BOTH sides; require at least ~8 total activity
+        # to avoid flagging a retail trader who did one buy and one sell as a router
         router_candidates = [
             w for w, a in per_wallet.items()
             if w not in ROUTERS and a['buys'] > 0 and a['sells'] > 0
+            and (a['buys'] + a['sells']) >= 8
         ]
-        # Sort by activity desc — most-used first, so budget spends on the meaningful ones
         router_candidates.sort(key=lambda w: -(per_wallet[w]['buys'] + per_wallet[w]['sells']))
-        for w in router_candidates[:30]:  # cap contract probes to avoid blowing up on odd tokens
+        for w in router_candidates[:40]:
             if self._is_contract(w):
                 suspicious.add(w)
 
@@ -289,11 +291,9 @@ class Matcher:
         return dict(stats), pairs
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5, min_activity=True, tol=0.05):
-        """Return a blended top-N:
-          - 'sellers' bucket: wallets that sold, whose invested AND sold fall within ±tol of targets
-          - 'holders' bucket: wallets that bought within ±tol of invested but haven't sold
-          When sold_eth > 0 we mix ~60% sellers + ~40% holders so the user sees both kinds.
-          `tol` is a relative tolerance (0.05 = ±5%).
+        """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol of the
+        sold target. When sold_eth is 0, returns matches that only bought the target amount.
+        `tol` is relative — 0.05 = ±5%.
         """
         stats, pairs = self.build_wallet_stats(token)
         eps = 1e-6
@@ -301,15 +301,31 @@ class Matcher:
         inv_hi = invested_eth * (1 + tol)
         sold_lo = sold_eth * (1 - tol)
         sold_hi = sold_eth * (1 + tol)
-        sellers, holders = [], []
+
+        # Diagnostics so the bot can tell the user WHY nothing matched
+        filt = {'total': len(stats), 'inv_ok': 0, 'sell_ok': 0}
+        results = []
         for wallet, s in stats.items():
             if min_activity and s['n_buys'] == 0:
                 continue
-            # hard tolerance on invested — must be within ±tol of target
             if not (inv_lo <= s['eth_in'] <= inv_hi):
                 continue
+            filt['inv_ok'] += 1
+
+            if sold_eth > 0:
+                # hard filter: must have actually sold within ±tol of target
+                if s['n_sells'] == 0 or s['eth_out'] == 0:
+                    continue
+                if not (sold_lo <= s['eth_out'] <= sold_hi):
+                    continue
+                filt['sell_ok'] += 1
+                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+            else:
+                rel_sold = 0
+                filt['sell_ok'] += 1
+
             rel_inv = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
-            rec_base = {
+            results.append({
                 'wallet': wallet,
                 'invested_eth': s['eth_in'],
                 'sold_eth': s['eth_out'],
@@ -320,34 +336,11 @@ class Matcher:
                 'last_block': s['last_block'],
                 'last_buy_ts': s['last_buy_ts'],
                 'last_sell_ts': s['last_sell_ts'],
-            }
-            if s['n_sells'] > 0 and s['eth_out'] > 0:
-                # sellers must ALSO be within ±tol on sold amount
-                if sold_eth > 0 and not (sold_lo <= s['eth_out'] <= sold_hi):
-                    continue
-                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps))) if sold_eth > 0 else 0
-                sellers.append({**rec_base, 'dist': rel_inv + rel_sold, 'bucket': 'seller'})
-            else:
-                holders.append({**rec_base, 'dist': rel_inv, 'bucket': 'holder'})
-
-        sellers.sort(key=lambda r: r['dist'])
-        holders.sort(key=lambda r: r['dist'])
-
-        if sold_eth > 0:
-            # ~60% sellers / 40% holders, but fill from the other bucket if one is short
-            n_sell = max(1, round(top_n * 0.6))
-            n_hold = top_n - n_sell
-            out = sellers[:n_sell] + holders[:n_hold]
-            if len(out) < top_n:
-                # top up from whichever bucket still has entries
-                extra_sellers = sellers[n_sell:]
-                extra_holders = holders[n_hold:]
-                out += (extra_sellers + extra_holders)[: top_n - len(out)]
-        else:
-            # no sold target — just rank everyone by invested-distance
-            out = sorted(sellers + holders, key=lambda r: r['dist'])[:top_n]
-
-        return out, pairs, len(stats)
+                'dist': rel_inv + rel_sold,
+                'bucket': 'seller' if s['n_sells'] > 0 else 'holder',
+            })
+        results.sort(key=lambda r: r['dist'])
+        return results[:top_n], pairs, filt
 
 
 def get_eth_price_usd(cache_ttl=300, _cache=[0, 0]):

@@ -180,11 +180,11 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
             eth_price = get_eth_price_usd()
         inv_eth = inv_val / eth_price if inv_unit == 'usd' else inv_val
         sold_eth = sold_val / eth_price if sold_unit == 'usd' else sold_val
-        results, pairs, total = matcher.find_matches(token, inv_eth, sold_eth, top_n=5)
-        return results, pairs, total, inv_eth, sold_eth, eth_price
+        results, pairs, filt = matcher.find_matches(token, inv_eth, sold_eth, top_n=5)
+        return results, pairs, filt, inv_eth, sold_eth, eth_price
 
     try:
-        results, pairs, total, inv_eth, sold_eth, eth_price = await loop.run_in_executor(None, work)
+        results, pairs, filt, inv_eth, sold_eth, eth_price = await loop.run_in_executor(None, work)
     except Exception as e:
         log.exception("match error")
         await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
@@ -195,9 +195,15 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
         return
     if not results:
         await status.edit_text(
-            f"❌ No wallets within ±5% of the targets "
-            f"({inv_eth:.4f} ETH bought / {sold_eth:.4f} ETH sold) across {total} scanned wallets. "
-            f"Try slightly different amounts."
+            f"❌ *No wallets matched within ±5%* of your targets "
+            f"({inv_eth:.4f} ETH bought / {sold_eth:.4f} ETH sold).\n\n"
+            f"Filter funnel:\n"
+            f"• {filt['total']} total wallets scanned\n"
+            f"• {filt['inv_ok']} within ±5% on invested\n"
+            f"• {filt['sell_ok']} also within ±5% on sold\n\n"
+            f"Try widening the amounts, or the target wallet may have traded via a router we "
+            f"couldn't resolve.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -206,7 +212,7 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
     lines = [
         f"🎯 *Matches for* `{fmt_short(token)}`",
         f"_Target: bought {inv_eth:.4f} ETH · sold {sold_eth:.4f} ETH_  (≈${inv_eth*eth_price:,.0f} / ${sold_eth*eth_price:,.0f})",
-        f"_Scanned {total} unique wallets across {len(pairs)} pair(s)_",
+        f"_Scanned {filt['total']} wallets · {filt['inv_ok']} matched invest · {filt['sell_ok']} matched both_",
         "",
     ]
     for i, r in enumerate(results, 1):
