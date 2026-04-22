@@ -221,14 +221,104 @@ class Matcher:
         self._cache_set(key, all_trades)
         return all_trades
 
+    def _add_trade(self, stats, wallet, is_buy, eth_amt, blk, ts):
+        s = stats[wallet]
+        if is_buy:
+            s['eth_in'] += eth_amt
+            s['n_buys'] += 1
+            s['buy_ts'].append(ts)
+            if ts > s['last_buy_ts']:
+                s['last_buy_ts'] = ts
+        else:
+            s['eth_out'] += eth_amt
+            s['n_sells'] += 1
+            s['sell_ts'].append(ts)
+            if ts > s['last_sell_ts']:
+                s['last_sell_ts'] = ts
+        if s['first_block'] == 0 or (blk and blk < s['first_block']):
+            s['first_block'] = blk
+        if blk > s['last_block']:
+            s['last_block'] = blk
+
+    def _etherscan_extend(self, token, pools, stats, ts_cutoff_per_pool,
+                          origin_budget_seconds=40, origin_max_lookups=600):
+        """Augment `stats` with older trades from Etherscan, only adding events with
+        ts < ts_cutoff_per_pool[pool]. Resolves router-proxied trades to real EOA via
+        eth_getTransactionByHash. Cached origins are reused freely (perma-cache)."""
+        deadline = time.time() + origin_budget_seconds
+        lookups = 0
+
+        for pool_addr in pools:
+            cutoff = ts_cutoff_per_pool.get(pool_addr, 10**12)  # if pool not in Gecko, take all
+            tok_txs = self._tokentx_pair(token, pool_addr)
+            if not tok_txs:
+                continue
+            weth_txs = self._tokentx_pair(WETH, pool_addr)
+            weth_by_hash = defaultdict(list)
+            for w in weth_txs:
+                try:
+                    weth_by_hash[w['hash']].append({
+                        'to': w['to'].lower(), 'from': w['from'].lower(),
+                        'value': int(w['value']) / 1e18,
+                    })
+                except Exception:
+                    continue
+
+            for t in tok_txs:
+                try:
+                    to_a = t['to'].lower()
+                    from_a = t['from'].lower()
+                    h = t['hash']
+                    blk = int(t['blockNumber'])
+                    ts = int(t.get('timeStamp', 0) or 0)
+                except Exception:
+                    continue
+                if ts >= cutoff:
+                    continue  # already covered by Gecko
+
+                is_buy = (from_a == pool_addr and to_a != pool_addr)
+                is_sell = (to_a == pool_addr and from_a != pool_addr)
+                if not (is_buy or is_sell):
+                    continue
+                wallet = to_a if is_buy else from_a
+                if wallet == pool_addr:
+                    continue
+
+                eth_amt = 0.0
+                for w in weth_by_hash.get(h, []):
+                    if is_buy and w['to'] == pool_addr:
+                        eth_amt += w['value']
+                    elif is_sell and w['from'] == pool_addr:
+                        eth_amt += w['value']
+                if eth_amt <= 0:
+                    continue
+
+                # Router resolution: if wallet is a known router, fetch tx origin
+                if wallet in ROUTERS:
+                    cached = self._cache_get(f'origin_{h}', ttl=86400 * 365)
+                    if cached:
+                        wallet = cached
+                    elif lookups < origin_max_lookups and time.time() < deadline:
+                        origin = self._get_tx_origin(h)
+                        lookups += 1
+                        if origin and origin not in ROUTERS:
+                            wallet = origin
+                        else:
+                            continue
+                    else:
+                        continue  # budget exhausted, drop this trade
+
+                self._add_trade(stats, wallet, is_buy, eth_amt, blk, ts)
+
     def build_wallet_stats(self, token):
-        """Return {wallet: {eth_in, eth_out, n_buys, n_sells, buy_ts, sell_ts, ...}}, pools.
-        Uses GeckoTerminal's trades feed where `tx_from_address` is the real EOA signer —
-        no router resolution needed.
+        """Return {wallet: stats}, pools. Combines two sources:
+          1) GeckoTerminal — last ~600 trades/pool, EOA already attributed (fast, free).
+          2) Etherscan — older history, with router→EOA resolution for known routers
+             (Banana Gun, Maestro, 1inch, Universal, etc).
+        Sources are merged by per-pool timestamp cutoff so trades aren't double-counted.
         """
         pools = self._gecko_pools(token)
         if not pools:
-            # fall back to DexScreener pairs as the pool list
             pools = [{'addr': p['addr'], 'name': 'WETH pair', 'liquidity_usd': p['liquidity_usd']}
                      for p in self.get_pairs(token)]
         if not pools:
@@ -242,9 +332,12 @@ class Matcher:
             'last_buy_ts': 0, 'last_sell_ts': 0,
             'buy_ts': [], 'sell_ts': [],
         })
+        gecko_min_ts_per_pool = {}  # pool_addr -> earliest ts Gecko gave us
 
-        for pool in pools[:3]:  # top 3 pools by liquidity
+        # Pass A: GeckoTerminal (recent trades with EOA already)
+        for pool in pools[:3]:
             trades = self._gecko_trades(pool['addr'])
+            min_ts = None
             for t in trades:
                 a = t.get('attributes') or {}
                 wallet = (a.get('tx_from_address') or '').lower()
@@ -267,33 +360,27 @@ class Matcher:
                     except Exception:
                         ts = 0
 
-                # Determine ETH amount for this trade (only count WETH-paired trades)
                 if kind == 'buy' and from_tok == weth:
-                    eth_amt = from_amt
-                    is_buy = True
+                    eth_amt, is_buy = from_amt, True
                 elif kind == 'sell' and to_tok == weth:
-                    eth_amt = to_amt
-                    is_buy = False
+                    eth_amt, is_buy = to_amt, False
                 else:
-                    continue  # non-ETH-denominated leg, skip
+                    continue
 
-                s = stats[wallet]
-                if is_buy:
-                    s['eth_in'] += eth_amt
-                    s['n_buys'] += 1
-                    s['buy_ts'].append(ts)
-                    if ts > s['last_buy_ts']:
-                        s['last_buy_ts'] = ts
-                else:
-                    s['eth_out'] += eth_amt
-                    s['n_sells'] += 1
-                    s['sell_ts'].append(ts)
-                    if ts > s['last_sell_ts']:
-                        s['last_sell_ts'] = ts
-                if s['first_block'] == 0 or (blk and blk < s['first_block']):
-                    s['first_block'] = blk
-                if blk > s['last_block']:
-                    s['last_block'] = blk
+                self._add_trade(stats, wallet, is_buy, eth_amt, blk, ts)
+                if min_ts is None or ts < min_ts:
+                    min_ts = ts
+            if min_ts is not None:
+                gecko_min_ts_per_pool[pool['addr']] = min_ts
+
+        # Pass B: Etherscan (older history) — only for pools where the Etherscan key is set
+        if self.esk and self.esk != 'x' and self.esk != 'notneeded':
+            self._etherscan_extend(
+                token,
+                [p['addr'] for p in pools[:3]],
+                stats,
+                gecko_min_ts_per_pool,
+            )
 
         return dict(stats), pools
 
