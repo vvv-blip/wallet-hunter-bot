@@ -270,17 +270,20 @@ class Matcher:
             'n_buys': 0, 'n_sells': 0,
             'first_block': 0, 'last_block': 0,
             'last_buy_ts': 0, 'last_sell_ts': 0,
+            'buy_ts': [], 'sell_ts': [],
         })
         for tr in trades:
             s = stats[tr['wallet']]
             if tr['is_buy']:
                 s['eth_in'] += tr['eth']
                 s['n_buys'] += 1
+                s['buy_ts'].append(tr['ts'])
                 if tr['ts'] > s['last_buy_ts']:
                     s['last_buy_ts'] = tr['ts']
             else:
                 s['eth_out'] += tr['eth']
                 s['n_sells'] += 1
+                s['sell_ts'].append(tr['ts'])
                 if tr['ts'] > s['last_sell_ts']:
                     s['last_sell_ts'] = tr['ts']
             if s['first_block'] == 0 or tr['blk'] < s['first_block']:
@@ -289,6 +292,43 @@ class Matcher:
                 s['last_block'] = tr['blk']
 
         return dict(stats), pairs
+
+    def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):
+        """Return wallets that bought in [min_buy_ts, max_buy_ts] AND sold in [min_sell_ts,
+        max_sell_ts]. If a bound is None, that side is ignored. Ranks by total eth invested desc.
+        """
+        stats, pairs = self.build_wallet_stats(token)
+        require_buy = (min_buy_ts is not None) or (max_buy_ts is not None)
+        require_sell = (min_sell_ts is not None) or (max_sell_ts is not None)
+        lb, ub = min_buy_ts or 0, max_buy_ts or 10**12
+        ls, us = min_sell_ts or 0, max_sell_ts or 10**12
+        results = []
+        for wallet, s in stats.items():
+            buys_in = [t for t in s['buy_ts'] if lb <= t <= ub] if require_buy else s['buy_ts']
+            sells_in = [t for t in s['sell_ts'] if ls <= t <= us] if require_sell else s['sell_ts']
+            if require_buy and not buys_in:
+                continue
+            if require_sell and not sells_in:
+                continue
+            if not require_buy and not require_sell:
+                continue
+            results.append({
+                'wallet': wallet,
+                'invested_eth': s['eth_in'],
+                'sold_eth': s['eth_out'],
+                'pnl_eth': s['eth_out'] - s['eth_in'],
+                'n_buys': s['n_buys'],
+                'n_sells': s['n_sells'],
+                'n_buys_in_window': len(buys_in),
+                'n_sells_in_window': len(sells_in),
+                'first_buy_in_window': min(buys_in) if buys_in else 0,
+                'last_buy_in_window': max(buys_in) if buys_in else 0,
+                'first_sell_in_window': min(sells_in) if sells_in else 0,
+                'last_sell_in_window': max(sells_in) if sells_in else 0,
+            })
+        # rank by realized pnl desc, then invested desc as tiebreaker
+        results.sort(key=lambda r: (-r['pnl_eth'], -r['invested_eth']))
+        return results[:top_n], pairs, len(stats)
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5, min_activity=True, tol=0.05):
         """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol of the

@@ -12,6 +12,7 @@ Optional:
   BOT_CACHE_DIR        (default: /tmp/wallet_bot_cache)
 """
 import os, re, asyncio, html, logging, threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from telegram import Update
 from telegram.constants import ParseMode
@@ -58,6 +59,37 @@ def fmt_short(addr):
     return addr[:6] + '…' + addr[-4:]
 
 
+# ---- time parsing (for /searchtimes) ----
+# Accept:  unix ts in seconds OR ms  |  YYYY-MM-DD  |  YYYY-MM-DDTHH:MM  |  YYYY-MM-DDTHH:MM:SS
+# Use "_" as wildcard to leave a bound open, e.g.  /searchtimes 0xTOKEN 2026-04-01 _ 2026-04-10 _
+_TIME_FMTS = ['%Y-%m-%d', '%Y-%m-%dT%H:%M', '%Y-%m-%dT%H:%M:%S']
+
+def parse_time(s):
+    """Returns unix-seconds int, or None to mean 'no bound', or raises ValueError."""
+    if s is None:
+        return None
+    s = s.strip()
+    if s in ('', '_', '-', '*'):
+        return None
+    if re.match(r'^\d{9,11}$', s):
+        return int(s)
+    if re.match(r'^\d{12,14}$', s):
+        return int(s) // 1000  # ms -> s
+    for fmt in _TIME_FMTS:
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    raise ValueError(f"Can't parse time: {s}")
+
+
+def fmt_ts(ts):
+    if not ts:
+        return '—'
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime('%Y-%m-%d %H:%M')
+
+
 # ---- state for conversation flow ----
 WAIT_CONTRACT, WAIT_INVEST, WAIT_SOLD = range(3)
 
@@ -65,13 +97,17 @@ WAIT_CONTRACT, WAIT_INVEST, WAIT_SOLD = range(3)
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🔎 *Wallet Hunter Bot*\n\n"
-        "Find the wallet(s) that bought and sold a token with amounts closest to yours.\n\n"
-        "*Quick usage:*\n"
+        "Find wallets that traded a token with footprints similar to yours.\n\n"
+        "*By amounts:*\n"
         "`/find 0xTOKEN 0.5 2.3`\n"
-        "(invested 0.5 ETH, sold 2.3 ETH)\n\n"
-        "Or use USD:\n"
-        "`/find 0xTOKEN $500 $2300`\n\n"
-        "*Step-by-step:*\n"
+        "(bought 0.5 ETH, sold 2.3 ETH — matches within ±5%)\n"
+        "Or in USD: `/find 0xTOKEN $500 $2300`\n\n"
+        "*By time windows:*\n"
+        "`/searchtimes 0xTOKEN <minBuy> <maxBuy> <minSell> <maxSell>`\n"
+        "Dates: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or unix seconds. "
+        "Use `_` for an open bound.\n"
+        "Example: `/searchtimes 0xTOKEN 2026-03-01 2026-03-15 2026-04-01 2026-04-20`\n\n"
+        "*Step-by-step amount search:*\n"
         "`/hunt`   → I'll ask you 3 questions.\n\n"
         "*Other:*\n"
         "`/help` — show this\n"
@@ -239,6 +275,90 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
     )
 
 
+# ---- /searchtimes <token> <min_buy> <max_buy> <min_sell> <max_sell> ----
+async def searchtimes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if len(args) < 5:
+        await update.message.reply_text(
+            "Usage:\n"
+            "`/searchtimes <contract> <min_buy> <max_buy> <min_sell> <max_sell>`\n\n"
+            "Dates: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or unix seconds. "
+            "Use `_` for an open bound.\n\n"
+            "Example:\n"
+            "`/searchtimes 0xce82…95de 2026-03-01 2026-03-15 2026-04-01 2026-04-20`\n"
+            "(wallets that bought in early March and sold in April)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    try:
+        min_buy = parse_time(args[1])
+        max_buy = parse_time(args[2])
+        min_sell = parse_time(args[3])
+        max_sell = parse_time(args[4])
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+
+    status = await update.message.reply_text(
+        f"⏳ Scanning {fmt_short(token)} for wallets matching those time windows… (10–90 s)"
+    )
+
+    loop = asyncio.get_running_loop()
+
+    def work():
+        return matcher.search_by_times(token, min_buy, max_buy, min_sell, max_sell, top_n=10)
+
+    try:
+        results, pairs, total = await loop.run_in_executor(None, work)
+    except Exception as e:
+        log.exception("searchtimes error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not pairs:
+        await status.edit_text("❌ No Ethereum/WETH Uniswap pair found for that token on DexScreener.")
+        return
+    if not results:
+        await status.edit_text(
+            f"❌ No wallets match those time windows across {total} scanned wallets."
+        )
+        return
+
+    eth_price = get_eth_price_usd()
+    lines = [
+        f"⏱ *Time-match for* `{fmt_short(token)}`",
+        f"_Bought in {fmt_ts(min_buy)} → {fmt_ts(max_buy)}_",
+        f"_Sold in  {fmt_ts(min_sell)} → {fmt_ts(max_sell)}_",
+        f"_Scanned {total} wallets · {len(results)} match_",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        pnl_usd = r['pnl_eth'] * eth_price
+        roi = (r['pnl_eth'] / r['invested_eth'] * 100) if r['invested_eth'] > 0.00001 else 0
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   bought: {r['invested_eth']:.4f} ETH ({r['n_buys']}×, {r['n_buys_in_window']}× in window)\n"
+            f"   sold:   {r['sold_eth']:.4f} ETH ({r['n_sells']}×, {r['n_sells_in_window']}× in window)\n"
+            f"   pnl:    {r['pnl_eth']:+.4f} ETH  (${pnl_usd:+,.0f} · {roi:+.0f}%)\n"
+            f"   first buy in win: {fmt_ts(r['first_buy_in_window'])}\n"
+            f"   last sell in win: {fmt_ts(r['last_sell_in_window'])}\n"
+            f"   [etherscan](https://etherscan.io/address/{r['wallet']}) · "
+            f"[debank](https://debank.com/profile/{r['wallet']}) · "
+            f"[gmgn](https://gmgn.ai/eth/address/{r['wallet']})"
+        )
+        lines.append("")
+
+    await status.edit_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.MARKDOWN,
+        disable_web_page_preview=True,
+    )
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -275,6 +395,7 @@ def main():
     app.add_handler(CommandHandler('start', start_cmd))
     app.add_handler(CommandHandler('help', start_cmd))
     app.add_handler(CommandHandler('find', find_cmd))
+    app.add_handler(CommandHandler('searchtimes', searchtimes_cmd))
     app.add_handler(CommandHandler('clearcache', clearcache_cmd))
 
     conv = ConversationHandler(
