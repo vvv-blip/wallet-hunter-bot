@@ -214,11 +214,16 @@ class Matcher:
         for wallet, s in stats.items():
             if min_activity and s['n_buys'] == 0:
                 continue
-            # require SOME activity matching the direction user cares about
-            d_inv = abs(s['eth_in'] - invested_eth)
-            d_sold = abs(s['eth_out'] - sold_eth)
-            rel_inv = d_inv / max(invested_eth, 0.0001)
-            rel_sold = d_sold / max(sold_eth, 0.0001) if sold_eth > 0 else (0 if s['eth_out'] == 0 else 10)
+            if sold_eth > 0 and s['n_sells'] == 0:
+                continue
+            # symmetric log-distance — treats 2× and 0.5× the target as equal misses,
+            # and no-sells (eth_out=0) get a huge penalty instead of saturating at 1.0
+            eps = 1e-6
+            rel_inv = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
+            if sold_eth > 0:
+                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+            else:
+                rel_sold = 0 if s['eth_out'] == 0 else 10
             dist = rel_inv + rel_sold
             results.append({
                 'wallet': wallet,
