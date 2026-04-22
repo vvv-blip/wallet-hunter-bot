@@ -45,9 +45,11 @@ class Matcher:
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, key + '.json')
 
-    def _cache_get(self, key):
+    def _cache_get(self, key, ttl=None):
         p = self._cache_path(key)
-        if os.path.exists(p) and (time.time() - os.path.getmtime(p) < self.cache_ttl):
+        if ttl is None:
+            ttl = self.cache_ttl
+        if os.path.exists(p) and (time.time() - os.path.getmtime(p) < ttl):
             try: return json.load(open(p))
             except Exception: pass
         return None
@@ -102,6 +104,34 @@ class Matcher:
         self._cache_set(key, pairs)
         return pairs
 
+    def _is_contract(self, addr):
+        """True if addr has deployed code on-chain. Cached ~forever (code rarely changes)."""
+        addr = addr.lower()
+        key = f'code_{addr}'
+        cached = self._cache_get(key, ttl=86400 * 30)
+        if cached is not None:
+            return cached
+        js = self._es({'module': 'proxy', 'action': 'eth_getCode', 'address': addr, 'tag': 'latest'})
+        code = js.get('result') if isinstance(js, dict) else ''
+        is_c = isinstance(code, str) and code not in ('0x', '', '0x0')
+        self._cache_set(key, is_c)
+        return is_c
+
+    def _get_tx_origin(self, tx_hash):
+        """EOA signer (tx.from) for a tx hash. Cached forever."""
+        key = f'origin_{tx_hash.lower()}'
+        cached = self._cache_get(key, ttl=86400 * 365)
+        if cached is not None:
+            return cached
+        js = self._es({'module': 'proxy', 'action': 'eth_getTransactionByHash', 'txhash': tx_hash})
+        r = js.get('result') if isinstance(js, dict) else None
+        origin = ''
+        if isinstance(r, dict):
+            origin = (r.get('from') or '').lower()
+        if origin:
+            self._cache_set(key, origin)
+        return origin
+
     def _tokentx_pair(self, contract, pair):
         """Fetch all token transfers of `contract` where `pair` is sender or recipient.
         Up to ~50k transfers (5 pages × 10k)."""
@@ -127,18 +157,13 @@ class Matcher:
         return all_tx
 
     # ---- main aggregation ----
-    def build_wallet_stats(self, token):
+    def build_wallet_stats(self, token, origin_budget_seconds=15, origin_max_lookups=200):
         pairs = self.get_pairs(token)
         if not pairs:
             return {}, []
 
-        stats = defaultdict(lambda: {
-            'eth_in': 0.0, 'eth_out': 0.0,
-            'n_buys': 0, 'n_sells': 0,
-            'first_block': 0, 'last_block': 0,
-            'last_buy_ts': 0, 'last_sell_ts': 0,
-        })
-
+        # Pass 1: collect raw trades (don't skip routers yet — we'll reassign them)
+        trades = []
         for pair in pairs[:3]:  # cap at top-3 liquid pairs
             pair_low = pair['addr']
             tok_txs = self._tokentx_pair(token, pair_low)
@@ -146,7 +171,6 @@ class Matcher:
             if not tok_txs:
                 continue
 
-            # Build WETH events indexed by tx hash
             weth_by_hash = defaultdict(list)
             for w in weth_txs:
                 try:
@@ -173,7 +197,6 @@ class Matcher:
                 if not (is_buy or is_sell):
                     continue
 
-                # Match WETH flow in the same tx
                 weth_evs = weth_by_hash.get(h, [])
                 eth_amt = 0.0
                 if is_buy:
@@ -181,51 +204,112 @@ class Matcher:
                         if w['to'] == pair_low:
                             eth_amt += w['value']
                     wallet = to_a
-                    if wallet in ROUTERS or wallet == pair_low:
-                        continue
-                    s = stats[wallet]
-                    s['eth_in'] += eth_amt
-                    s['n_buys'] += 1
-                    if ts > s['last_buy_ts']:
-                        s['last_buy_ts'] = ts
-                else:  # sell
+                else:
                     for w in weth_evs:
                         if w['from'] == pair_low:
                             eth_amt += w['value']
                     wallet = from_a
-                    if wallet in ROUTERS or wallet == pair_low:
-                        continue
-                    s = stats[wallet]
-                    s['eth_out'] += eth_amt
-                    s['n_sells'] += 1
-                    if ts > s['last_sell_ts']:
-                        s['last_sell_ts'] = ts
 
-                if s['first_block'] == 0 or blk < s['first_block']:
-                    s['first_block'] = blk
-                if blk > s['last_block']:
-                    s['last_block'] = blk
+                if wallet == pair_low:
+                    continue
+
+                trades.append({
+                    'wallet': wallet, 'is_buy': is_buy, 'eth': eth_amt,
+                    'hash': h, 'blk': blk, 'ts': ts,
+                })
+
+        # Pass 2: detect unknown router/aggregator contracts (wallets with both buys & sells
+        # that happen to have on-chain code) and re-attribute their trades to tx origins
+        per_wallet = defaultdict(lambda: {'buys': 0, 'sells': 0})
+        for tr in trades:
+            k = 'buys' if tr['is_buy'] else 'sells'
+            per_wallet[tr['wallet']][k] += 1
+
+        suspicious = set(ROUTERS)
+        router_candidates = [
+            w for w, a in per_wallet.items()
+            if w not in ROUTERS and a['buys'] > 0 and a['sells'] > 0
+        ]
+        # Sort by activity desc — most-used first, so budget spends on the meaningful ones
+        router_candidates.sort(key=lambda w: -(per_wallet[w]['buys'] + per_wallet[w]['sells']))
+        for w in router_candidates[:30]:  # cap contract probes to avoid blowing up on odd tokens
+            if self._is_contract(w):
+                suspicious.add(w)
+
+        # Resolve tx origins for suspicious-wallet trades, bounded by time + count budget
+        if suspicious:
+            deadline = time.time() + origin_budget_seconds
+            lookups = 0
+            origin_by_hash = {}
+            reassigned = []
+            for tr in trades:
+                if tr['wallet'] not in suspicious:
+                    reassigned.append(tr)
+                    continue
+                h = tr['hash']
+                if h not in origin_by_hash:
+                    cached = self._cache_get(f'origin_{h}', ttl=86400 * 365)
+                    if cached is not None:
+                        origin_by_hash[h] = cached
+                    elif lookups < origin_max_lookups and time.time() < deadline:
+                        origin_by_hash[h] = self._get_tx_origin(h) or ''
+                        lookups += 1
+                    else:
+                        origin_by_hash[h] = ''
+                real = origin_by_hash[h]
+                if not real or real in suspicious or real == tr['wallet']:
+                    continue  # drop — couldn't resolve to an EOA
+                reassigned.append({**tr, 'wallet': real})
+            trades = reassigned
+
+        # Pass 3: aggregate per (final) wallet
+        stats = defaultdict(lambda: {
+            'eth_in': 0.0, 'eth_out': 0.0,
+            'n_buys': 0, 'n_sells': 0,
+            'first_block': 0, 'last_block': 0,
+            'last_buy_ts': 0, 'last_sell_ts': 0,
+        })
+        for tr in trades:
+            s = stats[tr['wallet']]
+            if tr['is_buy']:
+                s['eth_in'] += tr['eth']
+                s['n_buys'] += 1
+                if tr['ts'] > s['last_buy_ts']:
+                    s['last_buy_ts'] = tr['ts']
+            else:
+                s['eth_out'] += tr['eth']
+                s['n_sells'] += 1
+                if tr['ts'] > s['last_sell_ts']:
+                    s['last_sell_ts'] = tr['ts']
+            if s['first_block'] == 0 or tr['blk'] < s['first_block']:
+                s['first_block'] = tr['blk']
+            if tr['blk'] > s['last_block']:
+                s['last_block'] = tr['blk']
 
         return dict(stats), pairs
 
-    def find_matches(self, token, invested_eth, sold_eth, top_n=5, min_activity=True):
+    def find_matches(self, token, invested_eth, sold_eth, top_n=5, min_activity=True, tol=0.05):
+        """Return a blended top-N:
+          - 'sellers' bucket: wallets that sold, whose invested AND sold fall within ±tol of targets
+          - 'holders' bucket: wallets that bought within ±tol of invested but haven't sold
+          When sold_eth > 0 we mix ~60% sellers + ~40% holders so the user sees both kinds.
+          `tol` is a relative tolerance (0.05 = ±5%).
+        """
         stats, pairs = self.build_wallet_stats(token)
-        results = []
+        eps = 1e-6
+        inv_lo = invested_eth * (1 - tol)
+        inv_hi = invested_eth * (1 + tol)
+        sold_lo = sold_eth * (1 - tol)
+        sold_hi = sold_eth * (1 + tol)
+        sellers, holders = [], []
         for wallet, s in stats.items():
             if min_activity and s['n_buys'] == 0:
                 continue
-            if sold_eth > 0 and s['n_sells'] == 0:
+            # hard tolerance on invested — must be within ±tol of target
+            if not (inv_lo <= s['eth_in'] <= inv_hi):
                 continue
-            # symmetric log-distance — treats 2× and 0.5× the target as equal misses,
-            # and no-sells (eth_out=0) get a huge penalty instead of saturating at 1.0
-            eps = 1e-6
             rel_inv = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
-            if sold_eth > 0:
-                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
-            else:
-                rel_sold = 0 if s['eth_out'] == 0 else 10
-            dist = rel_inv + rel_sold
-            results.append({
+            rec_base = {
                 'wallet': wallet,
                 'invested_eth': s['eth_in'],
                 'sold_eth': s['eth_out'],
@@ -236,10 +320,34 @@ class Matcher:
                 'last_block': s['last_block'],
                 'last_buy_ts': s['last_buy_ts'],
                 'last_sell_ts': s['last_sell_ts'],
-                'dist': dist,
-            })
-        results.sort(key=lambda r: r['dist'])
-        return results[:top_n], pairs, len(stats)
+            }
+            if s['n_sells'] > 0 and s['eth_out'] > 0:
+                # sellers must ALSO be within ±tol on sold amount
+                if sold_eth > 0 and not (sold_lo <= s['eth_out'] <= sold_hi):
+                    continue
+                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps))) if sold_eth > 0 else 0
+                sellers.append({**rec_base, 'dist': rel_inv + rel_sold, 'bucket': 'seller'})
+            else:
+                holders.append({**rec_base, 'dist': rel_inv, 'bucket': 'holder'})
+
+        sellers.sort(key=lambda r: r['dist'])
+        holders.sort(key=lambda r: r['dist'])
+
+        if sold_eth > 0:
+            # ~60% sellers / 40% holders, but fill from the other bucket if one is short
+            n_sell = max(1, round(top_n * 0.6))
+            n_hold = top_n - n_sell
+            out = sellers[:n_sell] + holders[:n_hold]
+            if len(out) < top_n:
+                # top up from whichever bucket still has entries
+                extra_sellers = sellers[n_sell:]
+                extra_holders = holders[n_hold:]
+                out += (extra_sellers + extra_holders)[: top_n - len(out)]
+        else:
+            # no sold target — just rank everyone by invested-distance
+            out = sorted(sellers + holders, key=lambda r: r['dist'])[:top_n]
+
+        return out, pairs, len(stats)
 
 
 def get_eth_price_usd(cache_ttl=300, _cache=[0, 0]):

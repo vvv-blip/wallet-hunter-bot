@@ -194,7 +194,11 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
         await status.edit_text("❌ No Ethereum/WETH Uniswap pair found for that token on DexScreener.")
         return
     if not results:
-        await status.edit_text("❌ Found the pair but no non-router buyer activity.")
+        await status.edit_text(
+            f"❌ No wallets within ±5% of the targets "
+            f"({inv_eth:.4f} ETH bought / {sold_eth:.4f} ETH sold) across {total} scanned wallets. "
+            f"Try slightly different amounts."
+        )
         return
 
     eth_price = eth_price or get_eth_price_usd()
@@ -209,8 +213,9 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
         pnl_eth = r['pnl_eth']
         pnl_usd = pnl_eth * eth_price
         roi = (pnl_eth / r['invested_eth'] * 100) if r['invested_eth'] > 0.00001 else 0
+        tag = '💰 sold' if r.get('bucket') == 'seller' else '📦 still holding'
         lines.append(
-            f"*#{i}*  `{r['wallet']}`\n"
+            f"*#{i}*  {tag}  `{r['wallet']}`\n"
             f"   bought: {r['invested_eth']:.4f} ETH ({r['n_buys']}×)\n"
             f"   sold:   {r['sold_eth']:.4f} ETH ({r['n_sells']}×)\n"
             f"   pnl:    {pnl_eth:+.4f} ETH  (${pnl_usd:+,.0f} · {roi:+.0f}%)\n"
