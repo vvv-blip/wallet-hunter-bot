@@ -109,6 +109,9 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Example: `/searchtimes 0xTOKEN 2026-03-01 2026-03-15 2026-04-01 2026-04-20`\n\n"
         "*Step-by-step amount search:*\n"
         "`/hunt`   → I'll ask you 3 questions.\n\n"
+        "*Diagnostics:*\n"
+        "`/debug 0xTOKEN 0xWALLET` — show every buy/sell the bot sees for a wallet "
+        "(use when a wallet you expect isn't appearing).\n\n"
         "*Other:*\n"
         "`/help` — show this\n"
         "`/clearcache` — flush cached data",
@@ -359,6 +362,75 @@ async def searchtimes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---- /debug <token> <wallet>  -- show what the matcher actually sees for this wallet ----
+async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/debug <contract> <wallet>`\n"
+            "Shows exactly what buys/sells the bot is capturing for a specific wallet, "
+            "useful to figure out *why* it didn't show up in `/find`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    wallet = args[1].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token) or not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("Both args must be 0x… addresses.")
+        return
+
+    status = await update.message.reply_text(
+        f"🔍 Debugging {fmt_short(wallet)} on {fmt_short(token)}… (10–90 s)"
+    )
+
+    loop = asyncio.get_running_loop()
+    try:
+        info = await loop.run_in_executor(None, lambda: matcher.debug_wallet(token, wallet))
+    except Exception as e:
+        log.exception("debug error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    s = info['stats']
+    trace = info['trace'][:20]  # first 20 rows, don't blow past Telegram limit
+    is_c = info['is_contract']
+
+    if not s:
+        await status.edit_text(
+            f"❌ Saw *no trades* for `{wallet}` on token `{fmt_short(token)}`.\n\n"
+            f"Pools scanned: {len(info['pools_scanned'])} / {info['n_pools_total']}\n"
+            f"Wallet is contract: {is_c}\n\n"
+            f"Possible causes:\n"
+            f"• wallet traded on a pool outside the top 3 by liquidity\n"
+            f"• trades older than the Etherscan 50k-row cap per pool\n"
+            f"• tokentx didn't index (very recent) the transfers yet",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = [
+        f"🔍 *Debug* `{wallet}` on `{fmt_short(token)}`",
+        f"Is contract: {is_c}",
+        f"bought: *{s['eth_in']:.4f} ETH* ({s['n_buys']}×)",
+        f"sold:   *{s['eth_out']:.4f} ETH* ({s['n_sells']}×)",
+        f"pnl:    {s['eth_out']-s['eth_in']:+.4f} ETH",
+        f"last buy  {fmt_ts(s['last_buy_ts'])}",
+        f"last sell {fmt_ts(s['last_sell_ts'])}",
+        "",
+        f"_Trades attributed (showing {len(trace)}/{len(info['trace'])}):_",
+    ]
+    for t in trace:
+        src = t.get('source') or 'etherscan'
+        resolved_flag = '↺' if t.get('resolved') else ''
+        lines.append(
+            f"• [{src}{resolved_flag}] {fmt_ts(t['ts'])} "
+            f"{t['kind']:4} {t['eth']:.4f} ETH  tx:{fmt_short(t.get('hash','0x00'))}"
+        )
+
+    text = "\n".join(lines)[:4000]
+    await status.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -396,6 +468,7 @@ def main():
     app.add_handler(CommandHandler('help', start_cmd))
     app.add_handler(CommandHandler('find', find_cmd))
     app.add_handler(CommandHandler('searchtimes', searchtimes_cmd))
+    app.add_handler(CommandHandler('debug', debug_cmd))
     app.add_handler(CommandHandler('clearcache', clearcache_cmd))
 
     conv = ConversationHandler(
