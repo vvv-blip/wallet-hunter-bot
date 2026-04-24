@@ -241,23 +241,26 @@ class Matcher:
             s['last_block'] = blk
 
     def _etherscan_extend(self, token, pools, stats, ts_cutoff_per_pool,
-                          origin_budget_seconds=90, origin_max_lookups=1500,
-                          trace_wallet=None):
-        """Augment `stats` with older trades from Etherscan, only adding events with
-        ts < ts_cutoff_per_pool[pool]. Resolves router/contract-proxied trades to real EOA via
-        eth_getTransactionByHash. Cached origins are reused freely (perma-cache).
+                          origin_budget_seconds=60, origin_max_lookups=800,
+                          router_threshold=8, trace_wallet=None):
+        """Augment `stats` with older trades from Etherscan (ts < cutoff per pool).
 
-        Broader than router-only: ANY contract wallet triggers origin resolution, so we
-        catch sniper bots / custom routers / new Banana Gun versions we don't have
-        hardcoded. _is_contract is also perma-cached so the cold cost is paid once per
-        unique wallet per ~30 days.
+        Two-pass to keep API cost bounded:
+          Pass 1: parse all tokentx rows into `events`. Count appearances per wallet.
+          Pass 2: for wallets appearing >= router_threshold times OR in ROUTERS,
+                  _is_contract-check them (bounded ~20 calls per token). Contracts
+                  are flagged as routers. Then replay events, resolving router events
+                  via tx.from with a time/call budget.
+
+        Real traders almost never appear 8+ times on a single pool's tokentx; routers
+        appear hundreds of times. This focuses expensive lookups where they matter.
         """
         deadline = time.time() + origin_budget_seconds
         lookups = 0
-        trace = []  # filled when trace_wallet is set, for /debug command
+        trace = []
 
         for pool_addr in pools:
-            cutoff = ts_cutoff_per_pool.get(pool_addr, 10**12)  # if pool not in Gecko, take all
+            cutoff = ts_cutoff_per_pool.get(pool_addr, 10**12)
             tok_txs = self._tokentx_pair(token, pool_addr)
             if not tok_txs:
                 continue
@@ -272,6 +275,9 @@ class Matcher:
                 except Exception:
                     continue
 
+            # ---- Pass 1: parse events + count per-wallet appearances ----
+            events = []  # (wallet, is_buy, eth_amt, blk, ts, h)
+            appearance = defaultdict(int)
             for t in tok_txs:
                 try:
                     to_a = t['to'].lower()
@@ -282,14 +288,13 @@ class Matcher:
                 except Exception:
                     continue
                 if ts >= cutoff:
-                    continue  # already covered by Gecko
+                    continue
 
                 is_buy = (from_a == pool_addr and to_a != pool_addr)
                 is_sell = (to_a == pool_addr and from_a != pool_addr)
                 if not (is_buy or is_sell):
                     continue
                 wallet = to_a if is_buy else from_a
-                orig_wallet = wallet
                 if wallet == pool_addr:
                     continue
 
@@ -302,31 +307,42 @@ class Matcher:
                 if eth_amt <= 0:
                     continue
 
-                # Resolution: if wallet is a known router OR any deployed contract,
-                # fetch tx.from (the real EOA signer).
-                need_resolve = wallet in ROUTERS
-                if not need_resolve:
-                    # perma-cached; cheap on warm cache
-                    try:
-                        need_resolve = self._is_contract(wallet)
-                    except Exception:
-                        need_resolve = False
+                events.append((wallet, is_buy, eth_amt, blk, ts, h))
+                appearance[wallet] += 1
 
-                if need_resolve:
+            # ---- Pass 2: flag suspicious wallets (heavy hitters) as routers ----
+            # _is_contract is perma-cached; only called for wallets with many trades.
+            is_router = {a: True for a in ROUTERS if a in appearance}
+            suspicious = [w for w, n in appearance.items()
+                          if n >= router_threshold and w not in is_router]
+            # Hard cap so we never spam the RPC
+            for w in suspicious[:30]:
+                if time.time() >= deadline:
+                    break
+                try:
+                    if self._is_contract(w):
+                        is_router[w] = True
+                except Exception:
+                    continue
+
+            # ---- Pass 3: commit events, resolving router events to EOA ----
+            for wallet, is_buy, eth_amt, blk, ts, h in events:
+                orig_wallet = wallet
+                if wallet in is_router:
                     cached = self._cache_get(f'origin_{h}', ttl=86400 * 365)
                     if cached:
                         wallet = cached
                     elif lookups < origin_max_lookups and time.time() < deadline:
                         origin = self._get_tx_origin(h)
                         lookups += 1
-                        if origin and origin not in ROUTERS:
-                            # origin itself might be a smart-contract wallet (rare but
-                            # happens with Gnosis Safe); still prefer origin over router.
+                        if origin and origin not in ROUTERS and origin not in is_router:
                             wallet = origin
+                        elif origin and origin not in ROUTERS:
+                            wallet = origin  # best effort
                         else:
                             continue
                     else:
-                        continue  # budget exhausted, drop this trade
+                        continue
 
                 self._add_trade(stats, wallet, is_buy, eth_amt, blk, ts)
 
@@ -371,7 +387,7 @@ class Matcher:
         gecko_trace = []
 
         # Pass A: GeckoTerminal (recent trades with EOA already)
-        for pool in pools[:3]:
+        for pool in pools[:8]:
             trades = self._gecko_trades(pool['addr'])
             min_ts = None
             for t in trades:
@@ -420,7 +436,7 @@ class Matcher:
         if self.esk and self.esk != 'x' and self.esk != 'notneeded':
             es_trace = self._etherscan_extend(
                 token,
-                [p['addr'] for p in pools[:3]],
+                [p['addr'] for p in pools[:8]],
                 stats,
                 gecko_min_ts_per_pool,
                 trace_wallet=trace_wallet,
@@ -439,7 +455,7 @@ class Matcher:
         return {
             'wallet': wallet.lower(),
             'stats': s,  # None if we saw nothing
-            'pools_scanned': [p['addr'] for p in pools[:3]],
+            'pools_scanned': [p['addr'] for p in pools[:8]],
             'n_pools_total': len(pools),
             'trace': trace,
             'is_contract': self._is_contract(wallet),
