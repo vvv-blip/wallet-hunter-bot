@@ -368,10 +368,21 @@ class Matcher:
         If `trace_wallet` is given, also returns a list of every trade row encountered
         for that wallet (for /debug command).
         """
-        pools = self._gecko_pools(token)
-        if not pools:
-            pools = [{'addr': p['addr'], 'name': 'WETH pair', 'liquidity_usd': p['liquidity_usd']}
-                     for p in self.get_pairs(token)]
+        # Merge Gecko + DexScreener pool sources (dedupe by address, keep max liquidity)
+        gpools = self._gecko_pools(token)
+        dpairs = self.get_pairs(token)
+        by_addr = {}
+        for p in gpools:
+            by_addr[p['addr']] = {'addr': p['addr'], 'name': p.get('name', 'WETH pair'),
+                                  'liquidity_usd': p.get('liquidity_usd', 0)}
+        for p in dpairs:
+            a = p['addr']
+            liq = p.get('liquidity_usd', 0)
+            if a not in by_addr:
+                by_addr[a] = {'addr': a, 'name': 'WETH pair', 'liquidity_usd': liq}
+            else:
+                by_addr[a]['liquidity_usd'] = max(by_addr[a]['liquidity_usd'], liq)
+        pools = sorted(by_addr.values(), key=lambda x: -x['liquidity_usd'])
         if not pools:
             return ({}, [], []) if trace_wallet else ({}, [])
 
@@ -447,18 +458,67 @@ class Matcher:
         return dict(stats), pools
 
     def debug_wallet(self, token, wallet):
-        """Return what the matcher sees for a specific (token, wallet) pair.
-        Useful for /debug: reveals whether buys/sells are being captured, and
-        whether any had to go through router resolution."""
+        """Ground-truth diagnostic for a specific (token, wallet) pair.
+
+        1) Direct Etherscan query: every tokentx row where this wallet moved
+           this token. No pool filter, no router resolution — just the raw facts.
+        2) Run the regular pool-based matcher and compare.
+        3) Report which counter-party addresses (pools/routers) the wallet
+           touched, so we can see whether our scan missed a pool.
+        """
+        w = wallet.lower()
+        # --- Direct wallet-token query ---
+        js = self._es({
+            'module': 'account', 'action': 'tokentx',
+            'contractaddress': token, 'address': wallet,
+            'sort': 'desc', 'offset': 1000, 'page': 1,
+        })
+        direct_txs = js.get('result', []) if isinstance(js, dict) else []
+        if not isinstance(direct_txs, list):
+            direct_txs = []
+
+        direct_buys = 0
+        direct_sells = 0
+        counterparties = defaultdict(int)  # pool/router -> n tx
+        direct_trades = []
+        for t in direct_txs:
+            try:
+                to_a = t['to'].lower()
+                from_a = t['from'].lower()
+                ts = int(t.get('timeStamp', 0) or 0)
+                h = t['hash']
+            except Exception:
+                continue
+            if from_a == w:
+                direct_sells += 1
+                counterparties[to_a] += 1
+                direct_trades.append({'kind': 'sell', 'ts': ts, 'cpty': to_a, 'hash': h})
+            elif to_a == w:
+                direct_buys += 1
+                counterparties[from_a] += 1
+                direct_trades.append({'kind': 'buy', 'ts': ts, 'cpty': from_a, 'hash': h})
+
+        # --- Regular matcher output for comparison ---
         stats, pools, trace = self.build_wallet_stats(token, trace_wallet=wallet)
-        s = stats.get(wallet.lower())
+        s = stats.get(w)
+
+        scanned_set = {p['addr'] for p in pools[:8]}
+        missed_cpties = [a for a in counterparties if a not in scanned_set]
+
         return {
-            'wallet': wallet.lower(),
-            'stats': s,  # None if we saw nothing
+            'wallet': w,
+            'stats': s,
             'pools_scanned': [p['addr'] for p in pools[:8]],
             'n_pools_total': len(pools),
             'trace': trace,
             'is_contract': self._is_contract(wallet),
+            # direct-query diagnostics:
+            'direct_n': len(direct_txs),
+            'direct_buys': direct_buys,
+            'direct_sells': direct_sells,
+            'direct_counterparties': dict(counterparties),
+            'missed_counterparties': missed_cpties,
+            'direct_trades': direct_trades[:20],
         }
 
     def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):

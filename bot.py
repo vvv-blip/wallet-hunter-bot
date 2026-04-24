@@ -392,40 +392,67 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     s = info['stats']
-    trace = info['trace'][:20]  # first 20 rows, don't blow past Telegram limit
+    trace = info['trace'][:10]
     is_c = info['is_contract']
-
-    if not s:
-        await status.edit_text(
-            f"❌ Saw *no trades* for `{wallet}` on token `{fmt_short(token)}`.\n\n"
-            f"Pools scanned: {len(info['pools_scanned'])} / {info['n_pools_total']}\n"
-            f"Wallet is contract: {is_c}\n\n"
-            f"Possible causes:\n"
-            f"• wallet traded on a pool outside the top 3 by liquidity\n"
-            f"• trades older than the Etherscan 50k-row cap per pool\n"
-            f"• tokentx didn't index (very recent) the transfers yet",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
+    direct_n = info['direct_n']
+    direct_buys = info['direct_buys']
+    direct_sells = info['direct_sells']
+    cpties = info['direct_counterparties']
+    missed = info['missed_counterparties']
 
     lines = [
         f"🔍 *Debug* `{wallet}` on `{fmt_short(token)}`",
         f"Is contract: {is_c}",
-        f"bought: *{s['eth_in']:.4f} ETH* ({s['n_buys']}×)",
-        f"sold:   *{s['eth_out']:.4f} ETH* ({s['n_sells']}×)",
-        f"pnl:    {s['eth_out']-s['eth_in']:+.4f} ETH",
-        f"last buy  {fmt_ts(s['last_buy_ts'])}",
-        f"last sell {fmt_ts(s['last_sell_ts'])}",
+        f"Pools scanned: {len(info['pools_scanned'])} / {info['n_pools_total']}",
         "",
-        f"_Trades attributed (showing {len(trace)}/{len(info['trace'])}):_",
+        f"*Direct Etherscan tokentx (ground truth):*",
+        f"  {direct_n} transfers · {direct_buys} received · {direct_sells} sent",
     ]
-    for t in trace:
-        src = t.get('source') or 'etherscan'
-        resolved_flag = '↺' if t.get('resolved') else ''
-        lines.append(
-            f"• [{src}{resolved_flag}] {fmt_ts(t['ts'])} "
-            f"{t['kind']:4} {t['eth']:.4f} ETH  tx:{fmt_short(t.get('hash','0x00'))}"
-        )
+
+    if direct_n == 0:
+        lines += [
+            "",
+            "❌ Etherscan says this wallet never moved this token on mainnet.",
+            "",
+            "Possible causes:",
+            "• wrong token contract address?",
+            "• wallet traded on another chain (Base / BSC / etc)?",
+            "• gmgn showing off-chain or cross-chain data?",
+        ]
+        await status.edit_text("\n".join(lines)[:4000],
+                               parse_mode=ParseMode.MARKDOWN,
+                               disable_web_page_preview=True)
+        return
+
+    # show counterparties (pools/routers the wallet dealt with)
+    lines.append("")
+    lines.append("*Counterparties (pools/routers wallet touched):*")
+    for addr, n in sorted(cpties.items(), key=lambda x: -x[1])[:8]:
+        flag = "❌ NOT SCANNED" if addr in missed else "✅ scanned"
+        lines.append(f"  `{addr}` ×{n}  {flag}")
+
+    # aggregated stats from matcher
+    if s:
+        lines += [
+            "",
+            f"*Matcher aggregated:*",
+            f"  bought: {s['eth_in']:.4f} ETH ({s['n_buys']}×)",
+            f"  sold:   {s['eth_out']:.4f} ETH ({s['n_sells']}×)",
+            f"  pnl:    {s['eth_out']-s['eth_in']:+.4f} ETH",
+        ]
+    else:
+        lines += ["", "⚠️ Matcher aggregated nothing — check missed counterparties above."]
+
+    if trace:
+        lines.append("")
+        lines.append(f"_Sample attributed trades (showing {len(trace)}/{len(info['trace'])}):_")
+        for t in trace:
+            src = t.get('source') or 'etherscan'
+            resolved_flag = '↺' if t.get('resolved') else ''
+            lines.append(
+                f"• [{src}{resolved_flag}] {fmt_ts(t['ts'])} "
+                f"{t['kind']:4} {t['eth']:.4f} ETH"
+            )
 
     text = "\n".join(lines)[:4000]
     await status.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
