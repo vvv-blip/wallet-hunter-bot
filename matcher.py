@@ -460,6 +460,138 @@ class Matcher:
             return dict(stats), pools, gecko_trace + es_trace
         return dict(stats), pools
 
+    def wallet_token_totals(self, token, wallet):
+        """Exact buy/sell totals for a (token, wallet) pair using wallet-centric
+        Etherscan queries. Unlike pool-centric scans, this isn't capped by pool
+        activity (pools on active tokens have 100k+ tx, we only see the latest
+        10k). A wallet's own history fits in one page.
+
+        Handles all router patterns because we query:
+          1) tokentx(token, wallet)     — every time the wallet moved this token
+          2) tokentx(WETH, wallet)      — every time the wallet moved WETH
+          3) txlist(wallet)             — native ETH sent (buys pay ETH as tx.value)
+          4) txlistinternal(wallet)     — native ETH received (sells get ETH
+                                          from the router via unwrap/send)
+
+        For each token transfer tx hash, sum the wallet's ETH leg from those
+        sources — works regardless of which router / sniper bot was used.
+        """
+        w = wallet.lower()
+        cache_key = f'wtot_{token.lower()}_{w}'
+        cached = self._cache_get(cache_key, ttl=300)  # 5 min cache
+        if cached is not None:
+            return cached
+
+        def fetch(params):
+            js = self._es(params)
+            r = js.get('result', []) if isinstance(js, dict) else []
+            return r if isinstance(r, list) else []
+
+        tok_txs = fetch({
+            'module': 'account', 'action': 'tokentx',
+            'contractaddress': token, 'address': wallet,
+            'sort': 'desc', 'offset': 1000, 'page': 1,
+        })
+        weth_txs = fetch({
+            'module': 'account', 'action': 'tokentx',
+            'contractaddress': WETH, 'address': wallet,
+            'sort': 'desc', 'offset': 1000, 'page': 1,
+        })
+        norm_txs = fetch({
+            'module': 'account', 'action': 'txlist',
+            'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1,
+        })
+        int_txs = fetch({
+            'module': 'account', 'action': 'txlistinternal',
+            'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1,
+        })
+
+        weth_by_hash = defaultdict(list)
+        for x in weth_txs:
+            weth_by_hash[x.get('hash', '')].append(x)
+        norm_by_hash = {x.get('hash', ''): x for x in norm_txs}
+        int_by_hash = defaultdict(list)
+        for x in int_txs:
+            int_by_hash[x.get('hash', '')].append(x)
+
+        eth_in = 0.0
+        eth_out = 0.0
+        n_buys = 0
+        n_sells = 0
+        buy_ts = []
+        sell_ts = []
+        seen = set()  # dedupe multi-transfers within same tx (tax rows)
+        trades = []
+
+        for t in tok_txs:
+            try:
+                h = t['hash']
+                ts = int(t.get('timeStamp', 0) or 0)
+                f_a = t['from'].lower()
+                t_a = t['to'].lower()
+            except Exception:
+                continue
+            is_buy = (t_a == w)
+            is_sell = (f_a == w)
+            if not (is_buy or is_sell):
+                continue
+            key = (h, is_buy)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            eth_amt = 0.0
+            if is_buy:
+                # native ETH paid: tx.value from wallet
+                nt = norm_by_hash.get(h)
+                if nt and nt.get('from', '').lower() == w:
+                    try:
+                        eth_amt += int(nt.get('value', '0')) / 1e18
+                    except Exception:
+                        pass
+                # or WETH sent from wallet
+                for wt in weth_by_hash.get(h, []):
+                    if wt.get('from', '').lower() == w:
+                        try:
+                            eth_amt += int(wt.get('value', '0')) / 1e18
+                        except Exception:
+                            pass
+                if eth_amt > 0:
+                    eth_in += eth_amt
+                    n_buys += 1
+                    buy_ts.append(ts)
+                    trades.append({'kind': 'buy', 'ts': ts, 'eth': eth_amt, 'hash': h})
+            else:  # sell
+                # native ETH received via internal tx (router unwrap+send)
+                for it in int_by_hash.get(h, []):
+                    if it.get('to', '').lower() == w and it.get('isError', '0') == '0':
+                        try:
+                            eth_amt += int(it.get('value', '0')) / 1e18
+                        except Exception:
+                            pass
+                # or WETH received
+                for wt in weth_by_hash.get(h, []):
+                    if wt.get('to', '').lower() == w:
+                        try:
+                            eth_amt += int(wt.get('value', '0')) / 1e18
+                        except Exception:
+                            pass
+                if eth_amt > 0:
+                    eth_out += eth_amt
+                    n_sells += 1
+                    sell_ts.append(ts)
+                    trades.append({'kind': 'sell', 'ts': ts, 'eth': eth_amt, 'hash': h})
+
+        result = {
+            'eth_in': eth_in, 'eth_out': eth_out,
+            'n_buys': n_buys, 'n_sells': n_sells,
+            'buy_ts': buy_ts, 'sell_ts': sell_ts,
+            'trades': trades,
+            'n_tokentx': len(tok_txs),
+        }
+        self._cache_set(cache_key, result)
+        return result
+
     def debug_wallet(self, token, wallet):
         """Ground-truth diagnostic for a specific (token, wallet) pair.
 
@@ -554,6 +686,12 @@ class Matcher:
                 'cpty': dt['cpty'], 'found_pool': found_pool, 'eth_leg': eth_leg,
             })
 
+        # --- Wallet-centric totals (THE ground-truth number) ---
+        try:
+            totals = self.wallet_token_totals(token, wallet)
+        except Exception as e:
+            totals = {'error': str(e)[:200]}
+
         return {
             'wallet': w,
             'stats': s,
@@ -570,6 +708,8 @@ class Matcher:
             'direct_trades': direct_trades[:20],
             'pool_health': pool_health,
             'hash_diag': hash_diag,
+            # authoritative wallet-centric totals
+            'totals': totals,
         }
 
     def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):
@@ -609,10 +749,16 @@ class Matcher:
         results.sort(key=lambda r: (-r['pnl_eth'], -r['invested_eth']))
         return results[:top_n], pairs, len(stats)
 
-    def find_matches(self, token, invested_eth, sold_eth, top_n=5, min_activity=True, tol=0.05):
-        """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol of the
-        sold target. When sold_eth is 0, returns matches that only bought the target amount.
-        `tol` is relative — 0.05 = ±5%.
+    def find_matches(self, token, invested_eth, sold_eth, top_n=5,
+                     min_activity=True, tol=0.05, verify_top_k=40):
+        """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol
+        of the sold target. `tol` is relative — 0.05 = ±5%.
+
+        Two-stage: pool-scan for candidate discovery, then wallet-centric
+        verification for the top-K loosest matches. Pool-scan is capped by
+        Etherscan's 10k-rows-per-pool return, so totals can be partial on busy
+        tokens. Wallet-centric verification (wallet_token_totals) has no such
+        cap and uses txlist+txlistinternal to catch native-ETH flows.
         """
         stats, pairs = self.build_wallet_stats(token)
         eps = 1e-6
@@ -621,42 +767,88 @@ class Matcher:
         sold_lo = sold_eth * (1 - tol)
         sold_hi = sold_eth * (1 + tol)
 
-        # Diagnostics so the bot can tell the user WHY nothing matched
-        filt = {'total': len(stats), 'inv_ok': 0, 'sell_ok': 0}
-        results = []
+        # Loose prefilter: wallets where pool-scan shows some activity AND at least
+        # rough order-of-magnitude match. Pool totals can be partial (capped), so
+        # we cast a wide net (5×) before the exact wallet-centric verify pass.
+        prefilter = []
         for wallet, s in stats.items():
-            if min_activity and s['n_buys'] == 0:
+            if s['n_buys'] + s['n_sells'] == 0:
                 continue
-            if not (inv_lo <= s['eth_in'] <= inv_hi):
+            # wallets with *at most* 5× the target amounts are candidates
+            if s['eth_in'] > max(invested_eth * 5, 5) + 1:
+                continue
+            if sold_eth > 0 and s['eth_out'] > max(sold_eth * 5, 5) + 1:
+                continue
+            # rough distance based on pool-scan values (sort to prioritize verify)
+            rel = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
+            if sold_eth > 0:
+                rel += abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+            prefilter.append((rel, wallet, s))
+        prefilter.sort(key=lambda x: x[0])
+
+        filt = {
+            'total': len(stats),
+            'prefilter': len(prefilter),
+            'verified': 0,
+            'inv_ok': 0,
+            'sell_ok': 0,
+        }
+
+        # Verify up to verify_top_k candidates via wallet-centric exact totals.
+        # Always include ALL wallets whose pool-scan stats already match ±tol on both
+        # axes (they're likely real matches — don't drop them just to fit K).
+        must_verify = set()
+        for _, wallet, s in prefilter:
+            if inv_lo <= s['eth_in'] <= inv_hi:
+                if sold_eth == 0 or (s['eth_out'] > 0 and sold_lo <= s['eth_out'] <= sold_hi):
+                    must_verify.add(wallet)
+
+        verify_set = list(must_verify)
+        for _, wallet, _ in prefilter:
+            if wallet in must_verify:
+                continue
+            if len(verify_set) >= verify_top_k:
+                break
+            verify_set.append(wallet)
+
+        results = []
+        for wallet in verify_set:
+            try:
+                tot = self.wallet_token_totals(token, wallet)
+            except Exception:
+                continue
+            filt['verified'] += 1
+            ei = tot['eth_in']
+            eo = tot['eth_out']
+
+            if not (inv_lo <= ei <= inv_hi):
                 continue
             filt['inv_ok'] += 1
-
             if sold_eth > 0:
-                # hard filter: must have actually sold within ±tol of target
-                if s['n_sells'] == 0 or s['eth_out'] == 0:
+                if tot['n_sells'] == 0 or eo == 0:
                     continue
-                if not (sold_lo <= s['eth_out'] <= sold_hi):
+                if not (sold_lo <= eo <= sold_hi):
                     continue
                 filt['sell_ok'] += 1
-                rel_sold = abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+                rel_sold = abs(math.log((eo + eps) / (sold_eth + eps)))
             else:
                 rel_sold = 0
                 filt['sell_ok'] += 1
 
-            rel_inv = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
+            rel_inv = abs(math.log((ei + eps) / (invested_eth + eps)))
             results.append({
                 'wallet': wallet,
-                'invested_eth': s['eth_in'],
-                'sold_eth': s['eth_out'],
-                'pnl_eth': s['eth_out'] - s['eth_in'],
-                'n_buys': s['n_buys'],
-                'n_sells': s['n_sells'],
-                'first_block': s['first_block'],
-                'last_block': s['last_block'],
-                'last_buy_ts': s['last_buy_ts'],
-                'last_sell_ts': s['last_sell_ts'],
+                'invested_eth': ei,
+                'sold_eth': eo,
+                'pnl_eth': eo - ei,
+                'n_buys': tot['n_buys'],
+                'n_sells': tot['n_sells'],
+                'first_block': 0,
+                'last_block': 0,
+                'last_buy_ts': max(tot['buy_ts']) if tot['buy_ts'] else 0,
+                'last_sell_ts': max(tot['sell_ts']) if tot['sell_ts'] else 0,
                 'dist': rel_inv + rel_sold,
-                'bucket': 'seller' if s['n_sells'] > 0 else 'holder',
+                'bucket': 'seller' if tot['n_sells'] > 0 else 'holder',
             })
         results.sort(key=lambda r: r['dist'])
         return results[:top_n], pairs, filt

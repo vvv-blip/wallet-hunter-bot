@@ -237,11 +237,12 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
             f"❌ *No wallets matched within ±5%* of your targets "
             f"({inv_eth:.4f} ETH bought / {sold_eth:.4f} ETH sold).\n\n"
             f"Filter funnel:\n"
-            f"• {filt['total']} total wallets scanned\n"
-            f"• {filt['inv_ok']} within ±5% on invested\n"
-            f"• {filt['sell_ok']} also within ±5% on sold\n\n"
-            f"Try widening the amounts, or the target wallet may have traded via a router we "
-            f"couldn't resolve.",
+            f"• {filt.get('total', 0)} pool-scan wallets\n"
+            f"• {filt.get('prefilter', 0)} in loose prefilter (within 5× of target)\n"
+            f"• {filt.get('verified', 0)} verified via wallet-centric totals\n"
+            f"• {filt.get('inv_ok', 0)} within ±5% on invested\n"
+            f"• {filt.get('sell_ok', 0)} also within ±5% on sold\n\n"
+            f"If you know a specific wallet, try `/debug {token} <wallet>` to inspect it.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -251,7 +252,10 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
     lines = [
         f"🎯 *Matches for* `{fmt_short(token)}`",
         f"_Target: bought {inv_eth:.4f} ETH · sold {sold_eth:.4f} ETH_  (≈${inv_eth*eth_price:,.0f} / ${sold_eth*eth_price:,.0f})",
-        f"_Scanned {filt['total']} wallets · {filt['inv_ok']} matched invest · {filt['sell_ok']} matched both_",
+        f"_{filt.get('total', 0)} pool-scan → "
+        f"{filt.get('prefilter', 0)} prefilter → "
+        f"{filt.get('verified', 0)} verified → "
+        f"{filt.get('sell_ok', 0)} match_",
         "",
     ]
     for i, r in enumerate(results, 1):
@@ -391,32 +395,23 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
         return
 
-    s = info['stats']
     is_c = info['is_contract']
     direct_n = info['direct_n']
-    direct_buys = info['direct_buys']
-    direct_sells = info['direct_sells']
-    cpties = info['direct_counterparties']
-    missed = info['missed_counterparties']
-    pool_health = info.get('pool_health', [])
-    hash_diag = info.get('hash_diag', [])
+    totals = info.get('totals') or {}
 
     lines = [
-        f"🔍 *Debug* `{wallet}` on `{fmt_short(token)}`",
+        f"🔍 *Debug* `{wallet}`",
+        f"Token: `{fmt_short(token)}`",
         f"Is contract: {is_c}",
-        f"Pools scanned: {len(info['pools_scanned'])} / {info['n_pools_total']}",
         "",
-        f"*Direct Etherscan tokentx (ground truth):*",
-        f"  {direct_n} transfers · {direct_buys} received · {direct_sells} sent",
     ]
 
     if direct_n == 0:
         lines += [
-            "",
-            "❌ Etherscan says this wallet never moved this token on mainnet.",
+            "❌ Etherscan shows this wallet never moved this token on mainnet.",
             "",
             "Possible causes:",
-            "• wrong token contract address?",
+            "• wrong contract address?",
             "• wallet traded on another chain (Base / BSC / etc)?",
         ]
         await status.edit_text("\n".join(lines)[:4000],
@@ -424,41 +419,35 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                disable_web_page_preview=True)
         return
 
-    # counterparties
-    lines.append("")
-    lines.append("*Counterparties:*")
-    for addr, n in sorted(cpties.items(), key=lambda x: -x[1])[:6]:
-        flag = "❌" if addr in missed else "✅"
-        lines.append(f"  {flag} `{fmt_short(addr)}` ×{n}")
+    if totals.get('error'):
+        lines.append(f"⚠️ totals query failed: {totals['error']}")
+    else:
+        # wallet-centric totals (the authoritative numbers)
+        pnl = totals['eth_out'] - totals['eth_in']
+        lines += [
+            f"*Wallet-centric totals (authoritative):*",
+            f"  bought: *{totals['eth_in']:.4f} ETH* ({totals['n_buys']}×)",
+            f"  sold:   *{totals['eth_out']:.4f} ETH* ({totals['n_sells']}×)",
+            f"  pnl:    {pnl:+.4f} ETH",
+            f"  {direct_n} raw tokentx rows seen",
+        ]
 
-    # pool health — is each scanned "pool" really a WETH pool?
-    if pool_health:
-        lines.append("")
-        lines.append("*Pool health (tokTx / wethTx):*")
-        for ph in pool_health[:6]:
-            ok = "✅" if ph['weth_tx'] > 10 else "⚠️ NOT WETH"
-            lines.append(f"  {ok} `{fmt_short(ph['addr'])}` {ph['token_tx']} / {ph['weth_tx']}")
+        trades = totals.get('trades') or []
+        if trades:
+            lines.append("")
+            lines.append(f"_Trades ({len(trades)}):_")
+            for t in trades[:15]:
+                lines.append(f"• {fmt_ts(t['ts'])}  {t['kind']:4} {t['eth']:.4f} ETH")
 
-    # per-hash: where did the WETH leg land?
-    if hash_diag:
-        lines.append("")
-        lines.append(f"*WETH-leg join (first {len(hash_diag)} of wallet's trades):*")
-        for hd in hash_diag:
-            found = fmt_short(hd['found_pool']) if hd['found_pool'] else '— NOT FOUND —'
-            lines.append(
-                f"  {hd['kind']:4} {hd['eth_leg']:.4f} ETH  via `{found}`"
-            )
-
-    # aggregated stats
+    # small pool-scan sanity at the bottom
+    s = info.get('stats')
     if s:
         lines += [
             "",
-            f"*Matcher aggregated:*",
-            f"  bought: {s['eth_in']:.4f} ETH ({s['n_buys']}×)",
-            f"  sold:   {s['eth_out']:.4f} ETH ({s['n_sells']}×)",
+            f"_(for reference, pool-scan had: "
+            f"{s['eth_in']:.4f} in / {s['eth_out']:.4f} out — "
+            f"may be partial due to pool 10k-row cap)_",
         ]
-    else:
-        lines += ["", "⚠️ Matcher aggregated nothing."]
 
     text = "\n".join(lines)[:4000]
     await status.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
