@@ -392,13 +392,14 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     s = info['stats']
-    trace = info['trace'][:10]
     is_c = info['is_contract']
     direct_n = info['direct_n']
     direct_buys = info['direct_buys']
     direct_sells = info['direct_sells']
     cpties = info['direct_counterparties']
     missed = info['missed_counterparties']
+    pool_health = info.get('pool_health', [])
+    hash_diag = info.get('hash_diag', [])
 
     lines = [
         f"🔍 *Debug* `{wallet}` on `{fmt_short(token)}`",
@@ -417,42 +418,47 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "Possible causes:",
             "• wrong token contract address?",
             "• wallet traded on another chain (Base / BSC / etc)?",
-            "• gmgn showing off-chain or cross-chain data?",
         ]
         await status.edit_text("\n".join(lines)[:4000],
                                parse_mode=ParseMode.MARKDOWN,
                                disable_web_page_preview=True)
         return
 
-    # show counterparties (pools/routers the wallet dealt with)
+    # counterparties
     lines.append("")
-    lines.append("*Counterparties (pools/routers wallet touched):*")
-    for addr, n in sorted(cpties.items(), key=lambda x: -x[1])[:8]:
-        flag = "❌ NOT SCANNED" if addr in missed else "✅ scanned"
-        lines.append(f"  `{addr}` ×{n}  {flag}")
+    lines.append("*Counterparties:*")
+    for addr, n in sorted(cpties.items(), key=lambda x: -x[1])[:6]:
+        flag = "❌" if addr in missed else "✅"
+        lines.append(f"  {flag} `{fmt_short(addr)}` ×{n}")
 
-    # aggregated stats from matcher
+    # pool health — is each scanned "pool" really a WETH pool?
+    if pool_health:
+        lines.append("")
+        lines.append("*Pool health (tokTx / wethTx):*")
+        for ph in pool_health[:6]:
+            ok = "✅" if ph['weth_tx'] > 10 else "⚠️ NOT WETH"
+            lines.append(f"  {ok} `{fmt_short(ph['addr'])}` {ph['token_tx']} / {ph['weth_tx']}")
+
+    # per-hash: where did the WETH leg land?
+    if hash_diag:
+        lines.append("")
+        lines.append(f"*WETH-leg join (first {len(hash_diag)} of wallet's trades):*")
+        for hd in hash_diag:
+            found = fmt_short(hd['found_pool']) if hd['found_pool'] else '— NOT FOUND —'
+            lines.append(
+                f"  {hd['kind']:4} {hd['eth_leg']:.4f} ETH  via `{found}`"
+            )
+
+    # aggregated stats
     if s:
         lines += [
             "",
             f"*Matcher aggregated:*",
             f"  bought: {s['eth_in']:.4f} ETH ({s['n_buys']}×)",
             f"  sold:   {s['eth_out']:.4f} ETH ({s['n_sells']}×)",
-            f"  pnl:    {s['eth_out']-s['eth_in']:+.4f} ETH",
         ]
     else:
-        lines += ["", "⚠️ Matcher aggregated nothing — check missed counterparties above."]
-
-    if trace:
-        lines.append("")
-        lines.append(f"_Sample attributed trades (showing {len(trace)}/{len(info['trace'])}):_")
-        for t in trace:
-            src = t.get('source') or 'etherscan'
-            resolved_flag = '↺' if t.get('resolved') else ''
-            lines.append(
-                f"• [{src}{resolved_flag}] {fmt_ts(t['ts'])} "
-                f"{t['kind']:4} {t['eth']:.4f} ETH"
-            )
+        lines += ["", "⚠️ Matcher aggregated nothing."]
 
     text = "\n".join(lines)[:4000]
     await status.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)

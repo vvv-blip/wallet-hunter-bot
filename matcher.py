@@ -368,21 +368,24 @@ class Matcher:
         If `trace_wallet` is given, also returns a list of every trade row encountered
         for that wallet (for /debug command).
         """
-        # Merge Gecko + DexScreener pool sources (dedupe by address, keep max liquidity)
-        gpools = self._gecko_pools(token)
+        # DexScreener is the authoritative source for pool/pair addresses (every DEX,
+        # every chain). Use it as the primary. Gecko/DS pair addresses are identical
+        # for pools that both index, so we don't need Gecko for pool discovery.
         dpairs = self.get_pairs(token)
-        by_addr = {}
-        for p in gpools:
-            by_addr[p['addr']] = {'addr': p['addr'], 'name': p.get('name', 'WETH pair'),
-                                  'liquidity_usd': p.get('liquidity_usd', 0)}
-        for p in dpairs:
-            a = p['addr']
-            liq = p.get('liquidity_usd', 0)
-            if a not in by_addr:
-                by_addr[a] = {'addr': a, 'name': 'WETH pair', 'liquidity_usd': liq}
-            else:
-                by_addr[a]['liquidity_usd'] = max(by_addr[a]['liquidity_usd'], liq)
-        pools = sorted(by_addr.values(), key=lambda x: -x['liquidity_usd'])
+        pools = [
+            {'addr': p['addr'], 'name': 'WETH pair', 'liquidity_usd': p.get('liquidity_usd', 0)}
+            for p in dpairs
+        ]
+        pools.sort(key=lambda x: -x['liquidity_usd'])
+
+        # Fallback: if DexScreener hasn't indexed the token yet, try Gecko
+        if not pools:
+            gpools = self._gecko_pools(token)
+            pools = [
+                {'addr': p['addr'], 'name': p.get('name', ''),
+                 'liquidity_usd': p.get('liquidity_usd', 0)}
+                for p in gpools
+            ]
         if not pools:
             return ({}, [], []) if trace_wallet else ({}, [])
 
@@ -505,6 +508,52 @@ class Matcher:
         scanned_set = {p['addr'] for p in pools[:8]}
         missed_cpties = [a for a in counterparties if a not in scanned_set]
 
+        # --- Per-pool health check: is each "pool" a real WETH pool? ---
+        # A real Uniswap WETH pool has many token-txs AND many WETH-txs. A mis-
+        # classified address (router/bot/bridge) will have lots of token-txs
+        # but 0 or very few WETH transfers where *it* is counterparty.
+        pool_health = []
+        for pool_addr in [p['addr'] for p in pools[:8]]:
+            try:
+                tok_n = len(self._tokentx_pair(token, pool_addr))
+                weth_n = len(self._tokentx_pair(WETH, pool_addr))
+            except Exception:
+                tok_n, weth_n = -1, -1
+            pool_health.append({'addr': pool_addr, 'token_tx': tok_n, 'weth_tx': weth_n})
+
+        # --- Per-trade trace: for each of the wallet's direct hashes, see where
+        #     the WETH leg landed (if anywhere in our scanned pools). ---
+        hash_diag = []
+        for dt in direct_trades[:10]:
+            h = dt['hash']
+            kind = dt['kind']
+            found_pool = None
+            eth_leg = 0.0
+            for pool_addr in [p['addr'] for p in pools[:8]]:
+                try:
+                    weth_txs = self._tokentx_pair(WETH, pool_addr)
+                except Exception:
+                    continue
+                for weth_t in weth_txs:
+                    if weth_t.get('hash') != h:
+                        continue
+                    wf = weth_t['from'].lower()
+                    wt_ = weth_t['to'].lower()
+                    val = int(weth_t['value']) / 1e18
+                    # buy: WETH to pool; sell: WETH from pool
+                    if kind == 'buy' and wt_ == pool_addr:
+                        eth_leg += val
+                        found_pool = pool_addr
+                    elif kind == 'sell' and wf == pool_addr:
+                        eth_leg += val
+                        found_pool = pool_addr
+                if found_pool:
+                    break
+            hash_diag.append({
+                'hash': h, 'kind': kind,
+                'cpty': dt['cpty'], 'found_pool': found_pool, 'eth_leg': eth_leg,
+            })
+
         return {
             'wallet': w,
             'stats': s,
@@ -519,6 +568,8 @@ class Matcher:
             'direct_counterparties': dict(counterparties),
             'missed_counterparties': missed_cpties,
             'direct_trades': direct_trades[:20],
+            'pool_health': pool_health,
+            'hash_diag': hash_diag,
         }
 
     def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):
