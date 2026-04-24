@@ -70,15 +70,19 @@ class Matcher:
     def _es(self, params):
         params = {**params, 'chainid': 1, 'apikey': self.esk}
         last_err = None
-        for _ in range(3):
+        for attempt in range(2):  # one quick retry, then give up
             try:
-                r = requests.get('https://api.etherscan.io/v2/api', params=params, timeout=25)
+                r = requests.get('https://api.etherscan.io/v2/api', params=params, timeout=15)
                 if r.status_code == 200:
                     return r.json()
                 last_err = f'http_{r.status_code}'
+                if r.status_code == 429:  # rate-limited; short back-off only
+                    time.sleep(0.3)
+                    continue
+                break  # any other non-200, don't retry
             except Exception as e:
                 last_err = str(e)
-                time.sleep(1)
+                time.sleep(0.3)
         return {'_error': last_err}
 
     def get_pairs(self, token):
@@ -482,29 +486,27 @@ class Matcher:
         if cached is not None:
             return cached
 
+        # Run the 4 independent queries in parallel (much faster under rate-limit)
+        from concurrent.futures import ThreadPoolExecutor
         def fetch(params):
             js = self._es(params)
             r = js.get('result', []) if isinstance(js, dict) else []
             return r if isinstance(r, list) else []
 
-        tok_txs = fetch({
-            'module': 'account', 'action': 'tokentx',
-            'contractaddress': token, 'address': wallet,
-            'sort': 'desc', 'offset': 1000, 'page': 1,
-        })
-        weth_txs = fetch({
-            'module': 'account', 'action': 'tokentx',
-            'contractaddress': WETH, 'address': wallet,
-            'sort': 'desc', 'offset': 1000, 'page': 1,
-        })
-        norm_txs = fetch({
-            'module': 'account', 'action': 'txlist',
-            'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1,
-        })
-        int_txs = fetch({
-            'module': 'account', 'action': 'txlistinternal',
-            'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1,
-        })
+        param_sets = [
+            {'module': 'account', 'action': 'tokentx',
+             'contractaddress': token, 'address': wallet,
+             'sort': 'desc', 'offset': 1000, 'page': 1},
+            {'module': 'account', 'action': 'tokentx',
+             'contractaddress': WETH, 'address': wallet,
+             'sort': 'desc', 'offset': 1000, 'page': 1},
+            {'module': 'account', 'action': 'txlist',
+             'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1},
+            {'module': 'account', 'action': 'txlistinternal',
+             'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1},
+        ]
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            tok_txs, weth_txs, norm_txs, int_txs = list(ex.map(fetch, param_sets))
 
         weth_by_hash = defaultdict(list)
         for x in weth_txs:
@@ -750,7 +752,8 @@ class Matcher:
         return results[:top_n], pairs, len(stats)
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5,
-                     min_activity=True, tol=0.05, verify_top_k=40):
+                     min_activity=True, tol=0.05, verify_top_k=15,
+                     verify_budget_seconds=45):
         """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol
         of the sold target. `tol` is relative — 0.05 = ±5%.
 
@@ -811,45 +814,63 @@ class Matcher:
                 break
             verify_set.append(wallet)
 
+        # Verify up to 3 wallets in parallel. Each wallet's 4 inner Etherscan
+        # queries are themselves parallelized inside wallet_token_totals, so we
+        # don't want more than ~3 here or we'll hit the free-tier RPS cap.
+        from concurrent.futures import ThreadPoolExecutor, as_completed
         results = []
-        for wallet in verify_set:
+        verify_deadline = time.time() + verify_budget_seconds
+
+        def verify_one(wallet):
+            if time.time() > verify_deadline:
+                return None
             try:
-                tot = self.wallet_token_totals(token, wallet)
+                return wallet, self.wallet_token_totals(token, wallet)
             except Exception:
-                continue
-            filt['verified'] += 1
-            ei = tot['eth_in']
-            eo = tot['eth_out']
+                return None
 
-            if not (inv_lo <= ei <= inv_hi):
-                continue
-            filt['inv_ok'] += 1
-            if sold_eth > 0:
-                if tot['n_sells'] == 0 or eo == 0:
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            futures = {ex.submit(verify_one, w): w for w in verify_set}
+            for fut in as_completed(futures):
+                if time.time() > verify_deadline:
+                    break
+                out = fut.result()
+                if not out:
                     continue
-                if not (sold_lo <= eo <= sold_hi):
-                    continue
-                filt['sell_ok'] += 1
-                rel_sold = abs(math.log((eo + eps) / (sold_eth + eps)))
-            else:
-                rel_sold = 0
-                filt['sell_ok'] += 1
+                wallet, tot = out
+                filt['verified'] += 1
+                ei = tot['eth_in']
+                eo = tot['eth_out']
 
-            rel_inv = abs(math.log((ei + eps) / (invested_eth + eps)))
-            results.append({
-                'wallet': wallet,
-                'invested_eth': ei,
-                'sold_eth': eo,
-                'pnl_eth': eo - ei,
-                'n_buys': tot['n_buys'],
-                'n_sells': tot['n_sells'],
-                'first_block': 0,
-                'last_block': 0,
-                'last_buy_ts': max(tot['buy_ts']) if tot['buy_ts'] else 0,
-                'last_sell_ts': max(tot['sell_ts']) if tot['sell_ts'] else 0,
-                'dist': rel_inv + rel_sold,
-                'bucket': 'seller' if tot['n_sells'] > 0 else 'holder',
-            })
+                if not (inv_lo <= ei <= inv_hi):
+                    continue
+                filt['inv_ok'] += 1
+                if sold_eth > 0:
+                    if tot['n_sells'] == 0 or eo == 0:
+                        continue
+                    if not (sold_lo <= eo <= sold_hi):
+                        continue
+                    filt['sell_ok'] += 1
+                    rel_sold = abs(math.log((eo + eps) / (sold_eth + eps)))
+                else:
+                    rel_sold = 0
+                    filt['sell_ok'] += 1
+
+                rel_inv = abs(math.log((ei + eps) / (invested_eth + eps)))
+                results.append({
+                    'wallet': wallet,
+                    'invested_eth': ei,
+                    'sold_eth': eo,
+                    'pnl_eth': eo - ei,
+                    'n_buys': tot['n_buys'],
+                    'n_sells': tot['n_sells'],
+                    'first_block': 0,
+                    'last_block': 0,
+                    'last_buy_ts': max(tot['buy_ts']) if tot['buy_ts'] else 0,
+                    'last_sell_ts': max(tot['sell_ts']) if tot['sell_ts'] else 0,
+                    'dist': rel_inv + rel_sold,
+                    'bucket': 'seller' if tot['n_sells'] > 0 else 'holder',
+                })
         results.sort(key=lambda r: r['dist'])
         return results[:top_n], pairs, filt
 
