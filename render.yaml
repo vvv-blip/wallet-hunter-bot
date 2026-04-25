@@ -7,7 +7,8 @@
 #   2) render.com → New → Blueprint → connect repo → apply.
 #   3) In the service dashboard, set secrets:
 #        TELEGRAM_BOT_TOKEN = <from @BotFather>
-#        ETHERSCAN_API_KEY  = <etherscan.io/v2 key>
+#        MORALIS_API_KEY    = <admin.moralis.com — primary trade-history source>
+#        ETHERSCAN_API_KEY  = <etherscan.io/v2 — optional, only for is_contract>
 #   4) Copy the public URL Render gives you (e.g. https://wallet-hunter-bot.onrender.com).
 #   5) UptimeRobot → Add New Monitor → HTTP(S) → that URL → 5-min interval.
 services:
@@ -20,6 +21,8 @@ services:
     envVars:
       - key: TELEGRAM_BOT_TOKEN
         sync: false      # set manually in Render dashboard
+      - key: MORALIS_API_KEY
+        sync: false
       - key: ETHERSCAN_API_KEY
         sync: false
       - key: PYTHON_VERSION

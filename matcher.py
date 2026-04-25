@@ -1,55 +1,60 @@
-"""Core matching logic: given a token + target (invested, sold) in ETH,
-find wallets on the token's main pair with the closest bought/sold footprint.
+"""Wallet match logic, backed by Moralis decoded-swaps APIs.
 
-Method:
-  1) DexScreener -> list the token's Uniswap V2/V3 pairs (WETH side only).
-  2) Etherscan tokentx filtered to (token, pair) -> every buy/sell of the token in/out of the pair.
-  3) Etherscan tokentx filtered to (WETH, pair) -> every ETH in/out of the same pair.
-  4) Join by tx_hash:
-       - token OUT of pair + WETH IN to pair  =>  BUY by `to` of the token transfer
-       - token IN to pair  + WETH OUT of pair =>  SELL by `from` of the token transfer
-  5) Aggregate per wallet, rank by relative distance to the user's (invested, sold) target.
+For every (token, wallet) pair we fetch already-decoded swap rows from Moralis:
+  - token-level scan       -> /erc20/{token}/swaps          (or Solana equivalent)
+  - per-wallet exact totals -> /wallets/{wallet}/swaps       (or Solana equivalent)
+
+Moralis returns each swap with the wallet that signed, the bought/sold legs
+(amount + symbol + USD), the pair address, and the DEX name.  This works
+across every Uniswap version (incl. V4 singleton pools), Sushi, Curve, etc.,
+and on Solana across Raydium, Orca, Meteora, Jupiter aggregator, Pump.fun, etc.
+
+The chain layer is a thin dict, so adding Solana later is a 5-line change.
 """
 import os, time, json, math, requests
 from collections import defaultdict
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---- chain config -----------------------------------------------------------
 
 WETH = '0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2'
 
-# DEX routers + aggregators — origin-wallet addresses we DO NOT treat as traders
-ROUTERS = {a.lower() for a in [
-    '0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D',  # Uniswap V2
-    '0xE592427A0AEce92De3Edee1F18E0157C05861564',  # Uniswap V3
-    '0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45',  # Uniswap V3 swap router 02
-    '0x3fC91A3afd70395Cd496C647d5a6CC9D4B2b7FAD',  # Universal V1
-    '0x66a9893cC07D91D95644AEDD05D03f95e1dBA8Af',  # Universal V2
-    '0xEf1c6E67703c7BD7107eed8303Fbe6EC2554BF6B',  # Universal V3
-    '0x1111111254EEB25477B68fb85Ed929f73A960582',  # 1inch v5
-    '0x111111125421cA6dc452d289314280a0f8842A65',  # 1inch v6
-    '0xDef1C0ded9bec7F1a1670819833240f027b25EfF',  # 0x
-    '0x9008D19f58AAbD9eD0D60971565AA8510560ab41',  # CoW
-    '0xb2ecfE4E4D61f8790bbb9DE2D1259B9e2410CEA5',  # ParaSwap
-    '0x1231deb6f5749ef6ce6943a275a1d3e7486f4eae',  # LI.FI Diamond
-    '0x881D40237659C251811CEC9c364ef91dC08D300C',  # Metamask Swap
-    '0x74de5d4fcbf63e00296fd95d33236b9794016631',  # Banana Gun router
-    '0x1a0a18ac4becddbd6389559687d1a73d8927e416',  # Maestro router
-    '0xd1742b3c4fbb096990c8950fa635aec75b30781a',  # Maestro
-    '0x80a64c6d7f12c47b7c66c5b4e20e72bc1fcd5d9e',  # Maestro v2
-    '0x00000000009726632680fb29d3f7a9734e3010e2',  # Rainbow router
-    '0x881d4032abe4188e2237efcd27ab435e81fc6bb1',  # Metamask Swaps (alt)
-    '0xa69babef1ca67a37ffaf7a485dfff3382056e78c',  # Matcha fee wrapper
-]}
+CHAINS = {
+    'eth': {
+        'moralis_base': 'https://deep-index.moralis.io/api/v2.2',
+        'wallet_swaps_path': '/wallets/{wallet}/swaps',
+        'token_swaps_path': '/erc20/{token}/swaps',
+        'chain_param': 'eth',
+        'native_symbols': ('WETH', 'ETH'),
+        'native_label': 'ETH',
+    },
+    'sol': {
+        'moralis_base': 'https://solana-gateway.moralis.io',
+        'wallet_swaps_path': '/account/mainnet/{wallet}/swaps',
+        'token_swaps_path': '/token/mainnet/{token}/swaps',
+        'chain_param': None,
+        'native_symbols': ('SOL', 'WSOL'),
+        'native_label': 'SOL',
+    },
+}
+
+# ----------------------------------------------------------------------------
 
 
 class Matcher:
-    def __init__(self, etherscan_key, cache_dir='/tmp/wallet_bot_cache', cache_ttl=1800):
-        assert etherscan_key, "Etherscan key required"
+    def __init__(self, etherscan_key='', moralis_key='', cache_dir='/tmp/wallet_bot_cache',
+                 cache_ttl=1800):
         self.esk = etherscan_key
+        self.mk = moralis_key
         self.cache_dir = cache_dir
         self.cache_ttl = cache_ttl
         os.makedirs(cache_dir, exist_ok=True)
+        if not moralis_key:
+            # Not fatal — caller can still hit get_pairs / pricing endpoints.
+            # But anything that needs trade history will return empty.
+            pass
 
-    # ---- cache helpers ----
+    # ---- cache helpers -----------------------------------------------------
     def _cache_path(self, key):
         return os.path.join(self.cache_dir, key + '.json')
 
@@ -66,27 +71,232 @@ class Matcher:
         try: json.dump(val, open(self._cache_path(key), 'w'))
         except Exception: pass
 
-    # ---- api helpers ----
-    def _es(self, params):
-        params = {**params, 'chainid': 1, 'apikey': self.esk}
+    # ---- moralis http -----------------------------------------------------
+    def _moralis(self, chain, path, params=None):
+        cfg = CHAINS[chain]
+        url = cfg['moralis_base'] + path
+        p = dict(params or {})
+        if cfg.get('chain_param'):
+            p['chain'] = cfg['chain_param']
+        headers = {'X-API-Key': self.mk, 'accept': 'application/json'}
         last_err = None
-        for attempt in range(2):  # one quick retry, then give up
+        for attempt in range(3):
             try:
-                r = requests.get('https://api.etherscan.io/v2/api', params=params, timeout=15)
+                r = requests.get(url, headers=headers, params=p, timeout=20)
                 if r.status_code == 200:
-                    return r.json()
+                    try: return r.json()
+                    except Exception: return {}
+                if r.status_code == 429:
+                    time.sleep(0.5 * (attempt + 1))
+                    last_err = 'http_429'; continue
                 last_err = f'http_{r.status_code}'
-                if r.status_code == 429:  # rate-limited; short back-off only
-                    time.sleep(0.3)
-                    continue
-                break  # any other non-200, don't retry
+                break
             except Exception as e:
-                last_err = str(e)
-                time.sleep(0.3)
+                last_err = str(e)[:120]; time.sleep(0.3)
         return {'_error': last_err}
 
+    def _moralis_paginate(self, chain, path, params, max_pages=15):
+        """Walks `cursor` pagination, returns flat list of swap rows."""
+        out = []
+        cursor = None
+        for page in range(max_pages):
+            p = dict(params)
+            p['limit'] = 100
+            if cursor: p['cursor'] = cursor
+            j = self._moralis(chain, path, p)
+            if not isinstance(j, dict) or '_error' in j:
+                break
+            rows = j.get('result') or []
+            out.extend(rows)
+            cursor = j.get('cursor')
+            if not cursor or not rows:
+                break
+        return out
+
+    # ---- normalize one moralis swap row ----------------------------------
+    def _normalize_swap(self, row, token, chain):
+        """Pull out the trade in (kind, eth_amt, ts, wallet, hash) form.
+
+        Returns None if the swap isn't priced in the chain's native token (e.g.
+        a USDC-only-leg trade on a stablecoin pool — we currently skip those).
+        """
+        cfg = CHAINS[chain]
+        kind = row.get('transactionType')  # 'buy' | 'sell'
+        wallet = (row.get('walletAddress') or '').lower()
+        hash_ = row.get('transactionHash')
+        ts_str = row.get('blockTimestamp') or ''
+        ts = 0
+        if ts_str:
+            # ISO8601 with Z; cheap parse without datetime
+            try:
+                from datetime import datetime
+                ts = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
+            except Exception:
+                ts = 0
+
+        bought = row.get('bought') or {}
+        sold = row.get('sold') or {}
+        bsym = (bought.get('symbol') or '').upper()
+        ssym = (sold.get('symbol') or '').upper()
+
+        def _f(x):
+            try: return abs(float(x))
+            except Exception: return 0.0
+
+        token_lc = (token or '').lower()
+        b_addr = (bought.get('address') or '').lower()
+        s_addr = (sold.get('address') or '').lower()
+
+        eth_amt = 0.0
+        if kind == 'buy':
+            # wallet paid quote (native), got the token
+            if ssym in cfg['native_symbols']:
+                eth_amt = _f(sold.get('amount'))
+            # If token filter requested, check the bought side matches
+            if token_lc and b_addr and b_addr != token_lc:
+                return None
+        elif kind == 'sell':
+            # wallet sold the token, got native
+            if bsym in cfg['native_symbols']:
+                eth_amt = _f(bought.get('amount'))
+            if token_lc and s_addr and s_addr != token_lc:
+                return None
+        else:
+            return None
+
+        if eth_amt <= 0 or not wallet or not kind:
+            return None
+
+        return {
+            'wallet': wallet,
+            'kind': kind,
+            'eth': eth_amt,
+            'usd': _f(row.get('totalValueUsd')),
+            'ts': ts,
+            'hash': hash_,
+            'pair_addr': (row.get('pairAddress') or '').lower(),
+            'pair_label': row.get('pairLabel') or '',
+            'exchange': row.get('exchangeName') or '',
+        }
+
+    # ---- public: token-level swap aggregation ---------------------------
+    def token_swaps(self, token, chain='eth', max_pages=200, ttl=600,
+                    since_ts=None, until_ts=None):
+        """All swaps on a token across every DEX, normalized.
+
+        Pagination is DESC-by-time (newest first).  We stop as soon as one of:
+          - cursor is None (we've seen everything in the window)
+          - max_pages reached
+          - the oldest row in the latest page is older than `since_ts`
+
+        `since_ts` / `until_ts` are unix-seconds; if given they pass through to
+        Moralis as `fromDate` / `toDate` so the server only paginates inside
+        the window. Use this for "scan only the last 30 days" type queries
+        on very-active tokens where the full history would be huge.
+
+        Returns the normalized list. Caches under a key derived from the
+        window so different windows don't clobber each other.
+        """
+        from datetime import datetime, timezone
+        ck = f'tswaps_{chain}_{token.lower()}_s{since_ts or 0}_u{until_ts or 0}_p{max_pages}'
+        cached = self._cache_get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        cfg = CHAINS[chain]
+        path = cfg['token_swaps_path'].replace('{token}', token)
+
+        params = {}
+        if since_ts:
+            params['fromDate'] = datetime.fromtimestamp(since_ts, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+        if until_ts:
+            params['toDate'] = datetime.fromtimestamp(until_ts, tz=timezone.utc).isoformat().replace('+00:00', 'Z')
+        params['order'] = 'DESC'
+
+        out = []
+        cursor = None
+        for page in range(max_pages):
+            p = dict(params)
+            p['limit'] = 100
+            if cursor: p['cursor'] = cursor
+            j = self._moralis(chain, path, p)
+            if not isinstance(j, dict) or '_error' in j:
+                break
+            rows = j.get('result') or []
+            for r in rows:
+                n = self._normalize_swap(r, token, chain)
+                if n: out.append(n)
+            cursor = j.get('cursor')
+            if not cursor or not rows:
+                break
+        self._cache_set(ck, out)
+        return out
+
+    def token_top_gainers(self, token, chain='eth', ttl=600):
+        """Returns up to ~97 wallets pre-aggregated by Moralis (sorted by
+        realized PnL %).  Each entry has total_usd_invested / total_sold_usd /
+        count_of_trades / realized_profit_usd — exactly what /find needs.
+
+        Free bonus discovery seed.  Not paginated by Moralis."""
+        ck = f'topgain_{chain}_{token.lower()}'
+        cached = self._cache_get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        if chain != 'eth':
+            self._cache_set(ck, []); return []
+        j = self._moralis(chain, f'/erc20/{token}/top-gainers', {'days': 'all'})
+        rows = (j.get('result') or []) if isinstance(j, dict) else []
+        self._cache_set(ck, rows)
+        return rows
+
+    def wallet_swaps(self, wallet, token, chain='eth', max_pages=10, ttl=300):
+        """All swaps by `wallet` on `token`, normalized.  Cached 5 min."""
+        ck = f'wswaps_{chain}_{wallet.lower()}_{token.lower()}_p{max_pages}'
+        cached = self._cache_get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        cfg = CHAINS[chain]
+        path = cfg['wallet_swaps_path'].replace('{wallet}', wallet)
+        params = {}
+        if chain == 'eth':
+            params['tokenAddress'] = token
+        else:
+            params['tokenAddress'] = token  # solana endpoint also supports this
+        rows = self._moralis_paginate(chain, path, params, max_pages=max_pages)
+        norm = []
+        for r in rows:
+            n = self._normalize_swap(r, token, chain)
+            if n: norm.append(n)
+        self._cache_set(ck, norm)
+        return norm
+
+    # ---- aggregation helpers ---------------------------------------------
+    def _empty_stats(self):
+        return {
+            'eth_in': 0.0, 'eth_out': 0.0,
+            'n_buys': 0, 'n_sells': 0,
+            'first_block': 0, 'last_block': 0,
+            'last_buy_ts': 0, 'last_sell_ts': 0,
+            'buy_ts': [], 'sell_ts': [],
+        }
+
+    def _add_swap_to_stats(self, stats, sw):
+        s = stats[sw['wallet']]
+        if sw['kind'] == 'buy':
+            s['eth_in'] += sw['eth']
+            s['n_buys'] += 1
+            s['buy_ts'].append(sw['ts'])
+            if sw['ts'] > s['last_buy_ts']:
+                s['last_buy_ts'] = sw['ts']
+        else:
+            s['eth_out'] += sw['eth']
+            s['n_sells'] += 1
+            s['sell_ts'].append(sw['ts'])
+            if sw['ts'] > s['last_sell_ts']:
+                s['last_sell_ts'] = sw['ts']
+
+    # ---- pool listing (DexScreener) — used for /find header info -------
     def get_pairs(self, token):
-        """Return list of Ethereum WETH pairs for the token, sorted by liquidity desc."""
+        """Ethereum WETH pairs sorted by liquidity desc.  Used for display only."""
         key = f'pairs_{token.lower()}'
         cached = self._cache_get(key)
         if cached is not None:
@@ -116,8 +326,28 @@ class Matcher:
         self._cache_set(key, pairs)
         return pairs
 
+    # ---- (optional) etherscan helpers — used only for is_contract -------
+    def _es(self, params):
+        if not self.esk:
+            return {'_error': 'no_etherscan_key'}
+        params = {**params, 'chainid': 1, 'apikey': self.esk}
+        last_err = None
+        for attempt in range(2):
+            try:
+                r = requests.get('https://api.etherscan.io/v2/api', params=params, timeout=15)
+                if r.status_code == 200:
+                    return r.json()
+                last_err = f'http_{r.status_code}'
+                if r.status_code == 429:
+                    time.sleep(0.3); continue
+                break
+            except Exception as e:
+                last_err = str(e)[:120]; time.sleep(0.3)
+        return {'_error': last_err}
+
     def _is_contract(self, addr):
-        """True if addr has deployed code on-chain. Cached ~forever (code rarely changes)."""
+        if not self.esk:
+            return False
         addr = addr.lower()
         key = f'code_{addr}'
         cached = self._cache_get(key, ttl=86400 * 30)
@@ -126,599 +356,120 @@ class Matcher:
         js = self._es({'module': 'proxy', 'action': 'eth_getCode', 'address': addr, 'tag': 'latest'})
         code = js.get('result') if isinstance(js, dict) else ''
         is_c = isinstance(code, str) and code not in ('0x', '', '0x0')
-        self._cache_set(key, is_c)
+        if isinstance(code, str):
+            self._cache_set(key, is_c)
         return is_c
 
-    def _get_tx_origin(self, tx_hash):
-        """EOA signer (tx.from) for a tx hash. Cached forever."""
-        key = f'origin_{tx_hash.lower()}'
-        cached = self._cache_get(key, ttl=86400 * 365)
-        if cached is not None:
-            return cached
-        js = self._es({'module': 'proxy', 'action': 'eth_getTransactionByHash', 'txhash': tx_hash})
-        r = js.get('result') if isinstance(js, dict) else None
-        origin = ''
-        if isinstance(r, dict):
-            origin = (r.get('from') or '').lower()
-        if origin:
-            self._cache_set(key, origin)
-        return origin
+    # ---- main pipeline ----------------------------------------------------
+    def build_wallet_stats(self, token, chain='eth', trace_wallet=None,
+                           max_pages=200, since_ts=None, until_ts=None):
+        """Aggregate per-wallet stats from Moralis token-swaps.
+        Returns ({wallet: stats}, pools[, trace]) when trace_wallet given.
+        `pools` is filled from DexScreener for display only (we no longer scan them).
 
-    def _tokentx_pair(self, contract, pair):
-        """Fetch all token transfers of `contract` where `pair` is sender or recipient.
-        Up to ~50k transfers (5 pages × 10k)."""
-        key = f'tkn_{contract.lower()}_{pair.lower()}'
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        all_tx = []
-        for page in range(1, 6):
-            js = self._es({
-                'module': 'account', 'action': 'tokentx',
-                'contractaddress': contract, 'address': pair,
-                'page': page, 'offset': 10000, 'sort': 'desc',
-            })
-            res = js.get('result', [])
-            if not isinstance(res, list) or not res:
-                break
-            all_tx.extend(res)
-            if len(res) < 10000:
-                break
-            time.sleep(0.22)
-        self._cache_set(key, all_tx)
-        return all_tx
-
-    # ---- GeckoTerminal data source: each trade already carries tx_from_address (the real EOA),
-    #      so router resolution isn't needed. Covers ~600 most-recent trades per pool.
-    def _gecko(self, path, params=None):
-        try:
-            r = requests.get(f'https://api.geckoterminal.com/api/v2/{path}', params=params or {}, timeout=20)
-            if r.status_code == 200:
-                return r.json()
-        except Exception:
-            pass
-        return {}
-
-    def _gecko_pools(self, token):
-        """Top WETH-paired pools on Ethereum for the token, sorted by reserve desc."""
-        key = f'gpools_{token.lower()}'
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        d = self._gecko(f'networks/eth/tokens/{token}/pools')
-        pools = []
-        for p in d.get('data') or []:
-            a = p.get('attributes') or {}
-            rel = (p.get('relationships') or {}).get('base_token', {}).get('data') or {}
-            try:
-                reserve = float(a.get('reserve_in_usd') or 0)
-            except Exception:
-                reserve = 0
-            pools.append({
-                'addr': (a.get('address') or '').lower(),
-                'name': a.get('name') or '',
-                'liquidity_usd': reserve,
-                'dex': (p.get('relationships', {}).get('dex', {}).get('data') or {}).get('id', ''),
-            })
-        # keep only WETH-paired (or WETH/-like named) pools
-        pools = [p for p in pools if 'WETH' in p['name'].upper() or 'ETH' in p['name'].upper()]
-        pools.sort(key=lambda x: -x['liquidity_usd'])
-        self._cache_set(key, pools)
-        return pools
-
-    def _gecko_trades(self, pool, max_pages=2):
-        """Up to 600 most-recent trades for a pool (Gecko caps at ~300/page, 2 pages)."""
-        key = f'gtrades_{pool.lower()}'
-        cached = self._cache_get(key)
-        if cached is not None:
-            return cached
-        all_trades = []
-        for page in range(1, max_pages + 1):
-            d = self._gecko(f'networks/eth/pools/{pool}/trades', {'page': page})
-            arr = d.get('data') or []
-            if not arr:
-                break
-            all_trades.extend(arr)
-            if len(arr) < 300:
-                break
-            time.sleep(0.3)  # gentle on the free tier
-        self._cache_set(key, all_trades)
-        return all_trades
-
-    def _add_trade(self, stats, wallet, is_buy, eth_amt, blk, ts):
-        s = stats[wallet]
-        if is_buy:
-            s['eth_in'] += eth_amt
-            s['n_buys'] += 1
-            s['buy_ts'].append(ts)
-            if ts > s['last_buy_ts']:
-                s['last_buy_ts'] = ts
-        else:
-            s['eth_out'] += eth_amt
-            s['n_sells'] += 1
-            s['sell_ts'].append(ts)
-            if ts > s['last_sell_ts']:
-                s['last_sell_ts'] = ts
-        if s['first_block'] == 0 or (blk and blk < s['first_block']):
-            s['first_block'] = blk
-        if blk > s['last_block']:
-            s['last_block'] = blk
-
-    def _etherscan_extend(self, token, pools, stats, ts_cutoff_per_pool,
-                          origin_budget_seconds=60, origin_max_lookups=800,
-                          router_threshold=8, trace_wallet=None):
-        """Augment `stats` with older trades from Etherscan (ts < cutoff per pool).
-
-        Two-pass to keep API cost bounded:
-          Pass 1: parse all tokentx rows into `events`. Count appearances per wallet.
-          Pass 2: for wallets appearing >= router_threshold times OR in ROUTERS,
-                  _is_contract-check them (bounded ~20 calls per token). Contracts
-                  are flagged as routers. Then replay events, resolving router events
-                  via tx.from with a time/call budget.
-
-        Real traders almost never appear 8+ times on a single pool's tokentx; routers
-        appear hundreds of times. This focuses expensive lookups where they matter.
+        `since_ts` / `until_ts` (unix seconds) bound the scan window.  Default
+        is no bound, capped only by max_pages (200 = up to 20k swaps).
         """
-        deadline = time.time() + origin_budget_seconds
-        lookups = 0
-        trace = []
-
-        for pool_addr in pools:
-            cutoff = ts_cutoff_per_pool.get(pool_addr, 10**12)
-            tok_txs = self._tokentx_pair(token, pool_addr)
-            if not tok_txs:
-                continue
-            weth_txs = self._tokentx_pair(WETH, pool_addr)
-            weth_by_hash = defaultdict(list)
-            for w in weth_txs:
-                try:
-                    weth_by_hash[w['hash']].append({
-                        'to': w['to'].lower(), 'from': w['from'].lower(),
-                        'value': int(w['value']) / 1e18,
-                    })
-                except Exception:
-                    continue
-
-            # ---- Pass 1: parse events + count per-wallet appearances ----
-            events = []  # (wallet, is_buy, eth_amt, blk, ts, h)
-            appearance = defaultdict(int)
-            for t in tok_txs:
-                try:
-                    to_a = t['to'].lower()
-                    from_a = t['from'].lower()
-                    h = t['hash']
-                    blk = int(t['blockNumber'])
-                    ts = int(t.get('timeStamp', 0) or 0)
-                except Exception:
-                    continue
-                if ts >= cutoff:
-                    continue
-
-                is_buy = (from_a == pool_addr and to_a != pool_addr)
-                is_sell = (to_a == pool_addr and from_a != pool_addr)
-                if not (is_buy or is_sell):
-                    continue
-                wallet = to_a if is_buy else from_a
-                if wallet == pool_addr:
-                    continue
-
-                eth_amt = 0.0
-                for w in weth_by_hash.get(h, []):
-                    if is_buy and w['to'] == pool_addr:
-                        eth_amt += w['value']
-                    elif is_sell and w['from'] == pool_addr:
-                        eth_amt += w['value']
-                if eth_amt <= 0:
-                    continue
-
-                events.append((wallet, is_buy, eth_amt, blk, ts, h))
-                appearance[wallet] += 1
-
-            # ---- Pass 2: flag suspicious wallets (heavy hitters) as routers ----
-            # _is_contract is perma-cached; only called for wallets with many trades.
-            is_router = {a: True for a in ROUTERS if a in appearance}
-            suspicious = [w for w, n in appearance.items()
-                          if n >= router_threshold and w not in is_router]
-            # Hard cap so we never spam the RPC
-            for w in suspicious[:30]:
-                if time.time() >= deadline:
-                    break
-                try:
-                    if self._is_contract(w):
-                        is_router[w] = True
-                except Exception:
-                    continue
-
-            # ---- Pass 3: commit events, resolving router events to EOA ----
-            for wallet, is_buy, eth_amt, blk, ts, h in events:
-                orig_wallet = wallet
-                if wallet in is_router:
-                    cached = self._cache_get(f'origin_{h}', ttl=86400 * 365)
-                    if cached:
-                        wallet = cached
-                    elif lookups < origin_max_lookups and time.time() < deadline:
-                        origin = self._get_tx_origin(h)
-                        lookups += 1
-                        if origin and origin not in ROUTERS and origin not in is_router:
-                            wallet = origin
-                        elif origin and origin not in ROUTERS:
-                            wallet = origin  # best effort
-                        else:
-                            continue
-                    else:
-                        continue
-
-                self._add_trade(stats, wallet, is_buy, eth_amt, blk, ts)
-
-                if trace_wallet and wallet == trace_wallet.lower():
-                    trace.append({
-                        'source': 'etherscan',
-                        'pool': pool_addr, 'hash': h, 'ts': ts, 'blk': blk,
-                        'kind': 'buy' if is_buy else 'sell',
-                        'eth': eth_amt, 'orig_from_to': orig_wallet,
-                        'resolved': orig_wallet != wallet,
-                    })
-
-        return trace
-
-    def build_wallet_stats(self, token, trace_wallet=None):
-        """Return {wallet: stats}, pools[, trace]. Combines two sources:
-          1) GeckoTerminal — last ~600 trades/pool, EOA already attributed (fast, free).
-          2) Etherscan — older history, with router/contract→EOA resolution. Any wallet
-             that has deployed code on-chain (routers, aggregators, sniper bots, Safes)
-             gets its tx origin resolved so we attribute the trade to the real EOA.
-        Sources are merged by per-pool timestamp cutoff so trades aren't double-counted.
-
-        If `trace_wallet` is given, also returns a list of every trade row encountered
-        for that wallet (for /debug command).
-        """
-        # DexScreener is the authoritative source for pool/pair addresses (every DEX,
-        # every chain). Use it as the primary. Gecko/DS pair addresses are identical
-        # for pools that both index, so we don't need Gecko for pool discovery.
-        dpairs = self.get_pairs(token)
-        pools = [
-            {'addr': p['addr'], 'name': 'WETH pair', 'liquidity_usd': p.get('liquidity_usd', 0)}
-            for p in dpairs
-        ]
-        pools.sort(key=lambda x: -x['liquidity_usd'])
-
-        # Fallback: if DexScreener hasn't indexed the token yet, try Gecko
-        if not pools:
-            gpools = self._gecko_pools(token)
-            pools = [
-                {'addr': p['addr'], 'name': p.get('name', ''),
-                 'liquidity_usd': p.get('liquidity_usd', 0)}
-                for p in gpools
-            ]
-        if not pools:
+        if not self.mk:
             return ({}, [], []) if trace_wallet else ({}, [])
 
-        weth = WETH.lower()
-        stats = defaultdict(lambda: {
-            'eth_in': 0.0, 'eth_out': 0.0,
-            'n_buys': 0, 'n_sells': 0,
-            'first_block': 0, 'last_block': 0,
-            'last_buy_ts': 0, 'last_sell_ts': 0,
-            'buy_ts': [], 'sell_ts': [],
-        })
-        gecko_min_ts_per_pool = {}  # pool_addr -> earliest ts Gecko gave us
-        gecko_trace = []
+        swaps = self.token_swaps(token, chain=chain, max_pages=max_pages,
+                                 since_ts=since_ts, until_ts=until_ts)
 
-        # Pass A: GeckoTerminal (recent trades with EOA already)
-        for pool in pools[:8]:
-            trades = self._gecko_trades(pool['addr'])
-            min_ts = None
-            for t in trades:
-                a = t.get('attributes') or {}
-                wallet = (a.get('tx_from_address') or '').lower()
-                if not wallet or wallet in ROUTERS:
-                    continue
-                kind = a.get('kind')
-                from_tok = (a.get('from_token_address') or '').lower()
-                to_tok = (a.get('to_token_address') or '').lower()
-                try:
-                    from_amt = float(a.get('from_token_amount') or 0)
-                    to_amt = float(a.get('to_token_amount') or 0)
-                    blk = int(a.get('block_number') or 0)
-                except Exception:
-                    continue
-                ts_str = a.get('block_timestamp') or ''
-                ts = 0
-                if ts_str:
-                    try:
-                        ts = int(datetime.fromisoformat(ts_str.replace('Z', '+00:00')).timestamp())
-                    except Exception:
-                        ts = 0
+        # build pools list from observed swaps (deduped by pair_addr) so we have
+        # a reasonable display even if DexScreener hasn't indexed yet
+        pool_idx = {}
+        for sw in swaps:
+            pa = sw.get('pair_addr')
+            if not pa: continue
+            pool_idx.setdefault(pa, {
+                'addr': pa,
+                'name': sw.get('pair_label') or '',
+                'dex': sw.get('exchange') or '',
+                'liquidity_usd': 0.0,
+            })
 
-                if kind == 'buy' and from_tok == weth:
-                    eth_amt, is_buy = from_amt, True
-                elif kind == 'sell' and to_tok == weth:
-                    eth_amt, is_buy = to_amt, False
-                else:
-                    continue
+        # enrich with dexscreener liquidity for display (eth only)
+        if chain == 'eth':
+            ds = self.get_pairs(token)
+            ds_by = {p['addr']: p for p in ds}
+            for addr, info in pool_idx.items():
+                if addr in ds_by:
+                    info['liquidity_usd'] = ds_by[addr]['liquidity_usd']
 
-                self._add_trade(stats, wallet, is_buy, eth_amt, blk, ts)
-                if trace_wallet and wallet == trace_wallet.lower():
-                    gecko_trace.append({
-                        'source': 'gecko', 'pool': pool['addr'],
-                        'ts': ts, 'blk': blk, 'hash': (a.get('tx_hash') or ''),
-                        'kind': 'buy' if is_buy else 'sell', 'eth': eth_amt,
-                    })
-                if min_ts is None or ts < min_ts:
-                    min_ts = ts
-            if min_ts is not None:
-                gecko_min_ts_per_pool[pool['addr']] = min_ts
+        pools = sorted(pool_idx.values(), key=lambda x: -x['liquidity_usd'])
 
-        # Pass B: Etherscan (older history) — only for pools where the Etherscan key is set
-        es_trace = []
-        if self.esk and self.esk != 'x' and self.esk != 'notneeded':
-            es_trace = self._etherscan_extend(
-                token,
-                [p['addr'] for p in pools[:8]],
-                stats,
-                gecko_min_ts_per_pool,
-                trace_wallet=trace_wallet,
-            ) or []
+        stats = defaultdict(self._empty_stats)
+        trace = []
+        twl = (trace_wallet or '').lower()
+        for sw in swaps:
+            self._add_swap_to_stats(stats, sw)
+            if twl and sw['wallet'] == twl:
+                trace.append({**sw, 'source': 'moralis_token'})
 
         if trace_wallet:
-            return dict(stats), pools, gecko_trace + es_trace
+            return dict(stats), pools, trace
         return dict(stats), pools
 
-    def wallet_token_totals(self, token, wallet):
-        """Exact buy/sell totals for a (token, wallet) pair using wallet-centric
-        Etherscan queries. Unlike pool-centric scans, this isn't capped by pool
-        activity (pools on active tokens have 100k+ tx, we only see the latest
-        10k). A wallet's own history fits in one page.
-
-        Handles all router patterns because we query:
-          1) tokentx(token, wallet)     — every time the wallet moved this token
-          2) tokentx(WETH, wallet)      — every time the wallet moved WETH
-          3) txlist(wallet)             — native ETH sent (buys pay ETH as tx.value)
-          4) txlistinternal(wallet)     — native ETH received (sells get ETH
-                                          from the router via unwrap/send)
-
-        For each token transfer tx hash, sum the wallet's ETH leg from those
-        sources — works regardless of which router / sniper bot was used.
-        """
-        w = wallet.lower()
-        cache_key = f'wtot_{token.lower()}_{w}'
-        cached = self._cache_get(cache_key, ttl=300)  # 5 min cache
-        if cached is not None:
-            return cached
-
-        # Run the 4 independent queries in parallel (much faster under rate-limit)
-        from concurrent.futures import ThreadPoolExecutor
-        def fetch(params):
-            js = self._es(params)
-            r = js.get('result', []) if isinstance(js, dict) else []
-            return r if isinstance(r, list) else []
-
-        param_sets = [
-            {'module': 'account', 'action': 'tokentx',
-             'contractaddress': token, 'address': wallet,
-             'sort': 'desc', 'offset': 1000, 'page': 1},
-            {'module': 'account', 'action': 'tokentx',
-             'contractaddress': WETH, 'address': wallet,
-             'sort': 'desc', 'offset': 1000, 'page': 1},
-            {'module': 'account', 'action': 'txlist',
-             'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1},
-            {'module': 'account', 'action': 'txlistinternal',
-             'address': wallet, 'sort': 'desc', 'offset': 1000, 'page': 1},
-        ]
-        with ThreadPoolExecutor(max_workers=4) as ex:
-            tok_txs, weth_txs, norm_txs, int_txs = list(ex.map(fetch, param_sets))
-
-        weth_by_hash = defaultdict(list)
-        for x in weth_txs:
-            weth_by_hash[x.get('hash', '')].append(x)
-        norm_by_hash = {x.get('hash', ''): x for x in norm_txs}
-        int_by_hash = defaultdict(list)
-        for x in int_txs:
-            int_by_hash[x.get('hash', '')].append(x)
-
-        eth_in = 0.0
-        eth_out = 0.0
-        n_buys = 0
-        n_sells = 0
-        buy_ts = []
-        sell_ts = []
-        seen = set()  # dedupe multi-transfers within same tx (tax rows)
+    def wallet_token_totals(self, token, wallet, chain='eth'):
+        """Exact buy/sell totals for (wallet, token).  Returns dict with
+        eth_in/eth_out/n_buys/n_sells/buy_ts/sell_ts/trades."""
+        swaps = self.wallet_swaps(wallet, token, chain=chain, max_pages=10)
+        eth_in = eth_out = 0.0
+        n_buys = n_sells = 0
+        buy_ts, sell_ts = [], []
         trades = []
-
-        for t in tok_txs:
-            try:
-                h = t['hash']
-                ts = int(t.get('timeStamp', 0) or 0)
-                f_a = t['from'].lower()
-                t_a = t['to'].lower()
-            except Exception:
-                continue
-            is_buy = (t_a == w)
-            is_sell = (f_a == w)
-            if not (is_buy or is_sell):
-                continue
-            key = (h, is_buy)
-            if key in seen:
-                continue
-            seen.add(key)
-
-            eth_amt = 0.0
-            if is_buy:
-                # native ETH paid: tx.value from wallet
-                nt = norm_by_hash.get(h)
-                if nt and nt.get('from', '').lower() == w:
-                    try:
-                        eth_amt += int(nt.get('value', '0')) / 1e18
-                    except Exception:
-                        pass
-                # or WETH sent from wallet
-                for wt in weth_by_hash.get(h, []):
-                    if wt.get('from', '').lower() == w:
-                        try:
-                            eth_amt += int(wt.get('value', '0')) / 1e18
-                        except Exception:
-                            pass
-                if eth_amt > 0:
-                    eth_in += eth_amt
-                    n_buys += 1
-                    buy_ts.append(ts)
-                    trades.append({'kind': 'buy', 'ts': ts, 'eth': eth_amt, 'hash': h})
-            else:  # sell
-                # native ETH received via internal tx (router unwrap+send)
-                for it in int_by_hash.get(h, []):
-                    if it.get('to', '').lower() == w and it.get('isError', '0') == '0':
-                        try:
-                            eth_amt += int(it.get('value', '0')) / 1e18
-                        except Exception:
-                            pass
-                # or WETH received
-                for wt in weth_by_hash.get(h, []):
-                    if wt.get('to', '').lower() == w:
-                        try:
-                            eth_amt += int(wt.get('value', '0')) / 1e18
-                        except Exception:
-                            pass
-                if eth_amt > 0:
-                    eth_out += eth_amt
-                    n_sells += 1
-                    sell_ts.append(ts)
-                    trades.append({'kind': 'sell', 'ts': ts, 'eth': eth_amt, 'hash': h})
-
-        result = {
+        for sw in swaps:
+            if sw['kind'] == 'buy':
+                eth_in += sw['eth']; n_buys += 1
+                buy_ts.append(sw['ts'])
+            else:
+                eth_out += sw['eth']; n_sells += 1
+                sell_ts.append(sw['ts'])
+            trades.append({'kind': sw['kind'], 'ts': sw['ts'],
+                           'eth': sw['eth'], 'usd': sw.get('usd', 0),
+                           'hash': sw['hash']})
+        return {
             'eth_in': eth_in, 'eth_out': eth_out,
             'n_buys': n_buys, 'n_sells': n_sells,
             'buy_ts': buy_ts, 'sell_ts': sell_ts,
             'trades': trades,
-            'n_tokentx': len(tok_txs),
+            'n_swaps': len(swaps),
         }
-        self._cache_set(cache_key, result)
-        return result
 
-    def debug_wallet(self, token, wallet):
-        """Ground-truth diagnostic for a specific (token, wallet) pair.
-
-        1) Direct Etherscan query: every tokentx row where this wallet moved
-           this token. No pool filter, no router resolution — just the raw facts.
-        2) Run the regular pool-based matcher and compare.
-        3) Report which counter-party addresses (pools/routers) the wallet
-           touched, so we can see whether our scan missed a pool.
-        """
+    def debug_wallet(self, token, wallet, chain='eth'):
+        """One-shot diagnostic for a (token, wallet) pair."""
         w = wallet.lower()
-        # --- Direct wallet-token query ---
-        js = self._es({
-            'module': 'account', 'action': 'tokentx',
-            'contractaddress': token, 'address': wallet,
-            'sort': 'desc', 'offset': 1000, 'page': 1,
-        })
-        direct_txs = js.get('result', []) if isinstance(js, dict) else []
-        if not isinstance(direct_txs, list):
-            direct_txs = []
-
-        direct_buys = 0
-        direct_sells = 0
-        counterparties = defaultdict(int)  # pool/router -> n tx
-        direct_trades = []
-        for t in direct_txs:
-            try:
-                to_a = t['to'].lower()
-                from_a = t['from'].lower()
-                ts = int(t.get('timeStamp', 0) or 0)
-                h = t['hash']
-            except Exception:
-                continue
-            if from_a == w:
-                direct_sells += 1
-                counterparties[to_a] += 1
-                direct_trades.append({'kind': 'sell', 'ts': ts, 'cpty': to_a, 'hash': h})
-            elif to_a == w:
-                direct_buys += 1
-                counterparties[from_a] += 1
-                direct_trades.append({'kind': 'buy', 'ts': ts, 'cpty': from_a, 'hash': h})
-
-        # --- Regular matcher output for comparison ---
-        stats, pools, trace = self.build_wallet_stats(token, trace_wallet=wallet)
-        s = stats.get(w)
-
-        scanned_set = {p['addr'] for p in pools[:8]}
-        missed_cpties = [a for a in counterparties if a not in scanned_set]
-
-        # --- Per-pool health check: is each "pool" a real WETH pool? ---
-        # A real Uniswap WETH pool has many token-txs AND many WETH-txs. A mis-
-        # classified address (router/bot/bridge) will have lots of token-txs
-        # but 0 or very few WETH transfers where *it* is counterparty.
-        pool_health = []
-        for pool_addr in [p['addr'] for p in pools[:8]]:
-            try:
-                tok_n = len(self._tokentx_pair(token, pool_addr))
-                weth_n = len(self._tokentx_pair(WETH, pool_addr))
-            except Exception:
-                tok_n, weth_n = -1, -1
-            pool_health.append({'addr': pool_addr, 'token_tx': tok_n, 'weth_tx': weth_n})
-
-        # --- Per-trade trace: for each of the wallet's direct hashes, see where
-        #     the WETH leg landed (if anywhere in our scanned pools). ---
-        hash_diag = []
-        for dt in direct_trades[:10]:
-            h = dt['hash']
-            kind = dt['kind']
-            found_pool = None
-            eth_leg = 0.0
-            for pool_addr in [p['addr'] for p in pools[:8]]:
-                try:
-                    weth_txs = self._tokentx_pair(WETH, pool_addr)
-                except Exception:
-                    continue
-                for weth_t in weth_txs:
-                    if weth_t.get('hash') != h:
-                        continue
-                    wf = weth_t['from'].lower()
-                    wt_ = weth_t['to'].lower()
-                    val = int(weth_t['value']) / 1e18
-                    # buy: WETH to pool; sell: WETH from pool
-                    if kind == 'buy' and wt_ == pool_addr:
-                        eth_leg += val
-                        found_pool = pool_addr
-                    elif kind == 'sell' and wf == pool_addr:
-                        eth_leg += val
-                        found_pool = pool_addr
-                if found_pool:
-                    break
-            hash_diag.append({
-                'hash': h, 'kind': kind,
-                'cpty': dt['cpty'], 'found_pool': found_pool, 'eth_leg': eth_leg,
-            })
-
-        # --- Wallet-centric totals (THE ground-truth number) ---
+        # authoritative wallet-centric query
         try:
-            totals = self.wallet_token_totals(token, wallet)
+            totals = self.wallet_token_totals(token, wallet, chain=chain)
         except Exception as e:
             totals = {'error': str(e)[:200]}
 
+        # for-reference: also compute the wallet's row in the token-scan stats
+        try:
+            stats, pools, trace = self.build_wallet_stats(token, chain=chain, trace_wallet=wallet)
+        except Exception:
+            stats, pools, trace = {}, [], []
+        s = stats.get(w)
+
         return {
             'wallet': w,
+            'token': token.lower(),
+            'chain': chain,
+            'native_label': CHAINS[chain]['native_label'],
+            'is_contract': self._is_contract(wallet) if chain == 'eth' else False,
+            'totals': totals,
             'stats': s,
             'pools_scanned': [p['addr'] for p in pools[:8]],
             'n_pools_total': len(pools),
             'trace': trace,
-            'is_contract': self._is_contract(wallet),
-            # direct-query diagnostics:
-            'direct_n': len(direct_txs),
-            'direct_buys': direct_buys,
-            'direct_sells': direct_sells,
-            'direct_counterparties': dict(counterparties),
-            'missed_counterparties': missed_cpties,
-            'direct_trades': direct_trades[:20],
-            'pool_health': pool_health,
-            'hash_diag': hash_diag,
-            # authoritative wallet-centric totals
-            'totals': totals,
         }
 
-    def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts, top_n=10):
-        """Return wallets that bought in [min_buy_ts, max_buy_ts] AND sold in [min_sell_ts,
-        max_sell_ts]. If a bound is None, that side is ignored. Ranks by total eth invested desc.
-        """
-        stats, pairs = self.build_wallet_stats(token)
+    def search_by_times(self, token, min_buy_ts, max_buy_ts, min_sell_ts, max_sell_ts,
+                        top_n=10, chain='eth'):
+        """Wallets with buy in [min_buy, max_buy] AND sell in [min_sell, max_sell]."""
+        stats, pairs = self.build_wallet_stats(token, chain=chain)
         require_buy = (min_buy_ts is not None) or (max_buy_ts is not None)
         require_sell = (min_sell_ts is not None) or (max_sell_ts is not None)
         lb, ub = min_buy_ts or 0, max_buy_ts or 10**12
@@ -727,12 +478,9 @@ class Matcher:
         for wallet, s in stats.items():
             buys_in = [t for t in s['buy_ts'] if lb <= t <= ub] if require_buy else s['buy_ts']
             sells_in = [t for t in s['sell_ts'] if ls <= t <= us] if require_sell else s['sell_ts']
-            if require_buy and not buys_in:
-                continue
-            if require_sell and not sells_in:
-                continue
-            if not require_buy and not require_sell:
-                continue
+            if require_buy and not buys_in: continue
+            if require_sell and not sells_in: continue
+            if not require_buy and not require_sell: continue
             results.append({
                 'wallet': wallet,
                 'invested_eth': s['eth_in'],
@@ -747,42 +495,90 @@ class Matcher:
                 'first_sell_in_window': min(sells_in) if sells_in else 0,
                 'last_sell_in_window': max(sells_in) if sells_in else 0,
             })
-        # rank by realized pnl desc, then invested desc as tiebreaker
         results.sort(key=lambda r: (-r['pnl_eth'], -r['invested_eth']))
         return results[:top_n], pairs, len(stats)
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5,
-                     min_activity=True, tol=0.05, verify_top_k=15,
-                     verify_budget_seconds=45):
-        """Return wallets within ±tol of the invested target AND (if sold_eth>0) ±tol
-        of the sold target. `tol` is relative — 0.05 = ±5%.
+                     min_activity=True, tol=0.05, verify_top_k=20,
+                     verify_budget_seconds=60, chain='eth',
+                     since_ts=None, until_ts=None, scan_max_pages=200):
+        """Return wallets within ±tol of both (invested, sold) targets.
 
-        Two-stage: pool-scan for candidate discovery, then wallet-centric
-        verification for the top-K loosest matches. Pool-scan is capped by
-        Etherscan's 10k-rows-per-pool return, so totals can be partial on busy
-        tokens. Wallet-centric verification (wallet_token_totals) has no such
-        cap and uses txlist+txlistinternal to catch native-ETH flows.
+        Pipeline:
+          1. Token-scan via Moralis -> per-wallet aggregate stats.
+             `since_ts`/`until_ts` (unix s) bound the scan window.
+          2. Loose prefilter: must have activity AND be within 5x of target.
+          3. Always include wallets already matching ±tol on aggregate stats.
+          4. Top up to verify_top_k by closeness.
+          5. Per-wallet exact lifetime totals via Moralis wallet-scan, in parallel.
+          6. Filter survivors to ±tol on the exact numbers.
         """
-        stats, pairs = self.build_wallet_stats(token)
         eps = 1e-6
+        stats, pairs = self.build_wallet_stats(
+            token, chain=chain,
+            since_ts=since_ts, until_ts=until_ts, max_pages=scan_max_pages,
+        )
         inv_lo = invested_eth * (1 - tol)
         inv_hi = invested_eth * (1 + tol)
         sold_lo = sold_eth * (1 - tol)
         sold_hi = sold_eth * (1 + tol)
 
-        # Loose prefilter: wallets where pool-scan shows some activity AND at least
-        # rough order-of-magnitude match. Pool totals can be partial (capped), so
-        # we cast a wide net (5×) before the exact wallet-centric verify pass.
+        # Free aggregated seed: Moralis' top-gainers leaderboard.  These wallets
+        # weren't necessarily caught by the recent-swaps scan, so always include
+        # them as candidates if their pre-aggregated USD totals are roughly in
+        # range.  Verification step will compute exact ETH totals.
+        eth_price_proxy = None  # lazy
+        seeded_via_topgainers = set()
+        if chain == 'eth':
+            try:
+                tg = self.token_top_gainers(token, chain=chain)
+            except Exception:
+                tg = []
+            for r in tg:
+                addr = (r.get('address') or '').lower()
+                if not addr:
+                    continue
+                # Convert pre-aggregated USD to rough ETH using live price
+                try:
+                    inv_usd = float(r.get('total_usd_invested') or 0)
+                    sold_usd = float(r.get('total_sold_usd') or 0)
+                except Exception:
+                    continue
+                # Lazily fetch ETH price to convert
+                if eth_price_proxy is None:
+                    try:
+                        eth_price_proxy = get_eth_price_usd()
+                    except Exception:
+                        eth_price_proxy = 3500.0
+                rough_in = inv_usd / max(eth_price_proxy, 1.0)
+                rough_out = sold_usd / max(eth_price_proxy, 1.0)
+                # 10x loose seed window — verify will tighten
+                if rough_in > max(invested_eth * 10, 10) + 1:
+                    continue
+                if sold_eth > 0 and rough_out > max(sold_eth * 10, 10) + 1:
+                    continue
+                if rough_in <= 0 and rough_out <= 0:
+                    continue
+                # If wallet not already in stats, inject a thin entry so prefilter sees it
+                if addr not in stats:
+                    stats[addr] = {
+                        'eth_in': rough_in, 'eth_out': rough_out,
+                        'n_buys': r.get('count_of_trades') or 0,
+                        'n_sells': r.get('count_of_trades') or 0,
+                        'first_block': 0, 'last_block': 0,
+                        'last_buy_ts': 0, 'last_sell_ts': 0,
+                        'buy_ts': [], 'sell_ts': [],
+                    }
+                seeded_via_topgainers.add(addr)
+
         prefilter = []
         for wallet, s in stats.items():
             if s['n_buys'] + s['n_sells'] == 0:
                 continue
-            # wallets with *at most* 5× the target amounts are candidates
-            if s['eth_in'] > max(invested_eth * 5, 5) + 1:
+            if s['eth_in'] > max(invested_eth * 10, 10) + 1:
                 continue
-            if sold_eth > 0 and s['eth_out'] > max(sold_eth * 5, 5) + 1:
+            if sold_eth > 0 and s['eth_out'] > max(sold_eth * 10, 10) + 1:
                 continue
-            # rough distance based on pool-scan values (sort to prioritize verify)
             rel = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
             if sold_eth > 0:
                 rel += abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
@@ -795,11 +591,10 @@ class Matcher:
             'verified': 0,
             'inv_ok': 0,
             'sell_ok': 0,
+            'top_gainers_seeded': len(seeded_via_topgainers),
         }
 
-        # Verify up to verify_top_k candidates via wallet-centric exact totals.
-        # Always include ALL wallets whose pool-scan stats already match ±tol on both
-        # axes (they're likely real matches — don't drop them just to fit K).
+        # Always-verify wallets already matching ±tol on aggregate stats.
         must_verify = set()
         for _, wallet, s in prefilter:
             if inv_lo <= s['eth_in'] <= inv_hi:
@@ -814,34 +609,28 @@ class Matcher:
                 break
             verify_set.append(wallet)
 
-        # Verify up to 3 wallets in parallel. Each wallet's 4 inner Etherscan
-        # queries are themselves parallelized inside wallet_token_totals, so we
-        # don't want more than ~3 here or we'll hit the free-tier RPS cap.
-        from concurrent.futures import ThreadPoolExecutor, as_completed
         results = []
-        verify_deadline = time.time() + verify_budget_seconds
+        deadline = time.time() + verify_budget_seconds
 
-        def verify_one(wallet):
-            if time.time() > verify_deadline:
+        def _verify(w):
+            if time.time() > deadline:
                 return None
             try:
-                return wallet, self.wallet_token_totals(token, wallet)
+                return w, self.wallet_token_totals(token, w, chain=chain)
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=3) as ex:
-            futures = {ex.submit(verify_one, w): w for w in verify_set}
-            for fut in as_completed(futures):
-                if time.time() > verify_deadline:
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            futs = {ex.submit(_verify, w): w for w in verify_set}
+            for fut in as_completed(futs):
+                if time.time() > deadline:
                     break
                 out = fut.result()
                 if not out:
                     continue
                 wallet, tot = out
                 filt['verified'] += 1
-                ei = tot['eth_in']
-                eo = tot['eth_out']
-
+                ei = tot['eth_in']; eo = tot['eth_out']
                 if not (inv_lo <= ei <= inv_hi):
                     continue
                 filt['inv_ok'] += 1
@@ -850,12 +639,10 @@ class Matcher:
                         continue
                     if not (sold_lo <= eo <= sold_hi):
                         continue
-                    filt['sell_ok'] += 1
                     rel_sold = abs(math.log((eo + eps) / (sold_eth + eps)))
                 else:
                     rel_sold = 0
-                    filt['sell_ok'] += 1
-
+                filt['sell_ok'] += 1
                 rel_inv = abs(math.log((ei + eps) / (invested_eth + eps)))
                 results.append({
                     'wallet': wallet,
@@ -864,8 +651,7 @@ class Matcher:
                     'pnl_eth': eo - ei,
                     'n_buys': tot['n_buys'],
                     'n_sells': tot['n_sells'],
-                    'first_block': 0,
-                    'last_block': 0,
+                    'first_block': 0, 'last_block': 0,
                     'last_buy_ts': max(tot['buy_ts']) if tot['buy_ts'] else 0,
                     'last_sell_ts': max(tot['sell_ts']) if tot['sell_ts'] else 0,
                     'dist': rel_inv + rel_sold,
@@ -875,6 +661,7 @@ class Matcher:
         return results[:top_n], pairs, filt
 
 
+# ---- ETH price helper (used by bot.py for $ <-> ETH conversion) -----------
 def get_eth_price_usd(cache_ttl=300, _cache=[0, 0]):
     """Cheap live ETH/USD via DexScreener WETH page."""
     now = time.time()

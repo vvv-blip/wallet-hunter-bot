@@ -6,9 +6,10 @@ Accepts:
 
 Env vars required:
   TELEGRAM_BOT_TOKEN   (from @BotFather)
-  ETHERSCAN_API_KEY    (etherscan.io/v2 key)
+  MORALIS_API_KEY      (admin.moralis.com — primary trade-history source)
 
 Optional:
+  ETHERSCAN_API_KEY    (only used for is_contract checks)
   BOT_CACHE_DIR        (default: /tmp/wallet_bot_cache)
 """
 import os, re, asyncio, html, logging, threading
@@ -25,9 +26,10 @@ log = logging.getLogger('walletbot')
 
 TELEGRAM_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN') or ''
 ETHERSCAN_KEY = os.environ.get('ETHERSCAN_API_KEY') or ''
+MORALIS_KEY = os.environ.get('MORALIS_API_KEY') or ''
 CACHE_DIR = os.environ.get('BOT_CACHE_DIR', '/tmp/wallet_bot_cache')
 
-matcher = Matcher(etherscan_key=ETHERSCAN_KEY, cache_dir=CACHE_DIR)
+matcher = Matcher(etherscan_key=ETHERSCAN_KEY, moralis_key=MORALIS_KEY, cache_dir=CACHE_DIR)
 
 # ---- parsing ----
 AMOUNT_RE = re.compile(r'^\s*\$?\s*([0-9]*\.?[0-9]+)\s*(eth|weth|usd|usdc|\$)?\s*$', re.I)
@@ -110,8 +112,14 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Step-by-step amount search:*\n"
         "`/hunt`   → I'll ask you 3 questions.\n\n"
         "*Diagnostics:*\n"
-        "`/debug 0xTOKEN 0xWALLET` — show every buy/sell the bot sees for a wallet "
-        "(use when a wallet you expect isn't appearing).\n\n"
+        "`/debug 0xTOKEN 0xWALLET` — show every buy/sell for one wallet "
+        "(use when a wallet you expect isn't appearing).\n"
+        "`/findwallet 0xTOKEN 0xWALLET <invested> <sold>` — verify if a specific "
+        "wallet matches your targets. Fast & always accurate, no scan needed.\n\n"
+        "*Tips:*\n"
+        "On very-active tokens, scanning all swaps is slow. Add `since:30d` or "
+        "`since:2026-04-01` to bound the look-back window:\n"
+        "`/find 0xTOKEN 0.5 2.3 since:7d`\n\n"
         "*Other:*\n"
         "`/help` — show this\n"
         "`/clearcache` — flush cached data",
@@ -185,12 +193,36 @@ async def hunt_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ---- /find direct command ----
+def _parse_since(s):
+    """Parse '7d' / '30d' / '24h' / '2026-04-01' / '2026-04-01T12:00' to unix seconds.
+    Returns None if unparseable."""
+    if not s:
+        return None
+    s = s.strip().lower()
+    m = re.match(r'^(\d+)\s*([dhwm])$', s)
+    if m:
+        n = int(m.group(1))
+        unit = m.group(2)
+        secs = {'h': 3600, 'd': 86400, 'w': 86400 * 7, 'm': 86400 * 30}[unit]
+        return int(datetime.now(timezone.utc).timestamp()) - n * secs
+    for fmt in ('%Y-%m-%d', '%Y-%m-%dT%H:%M', '%Y-%m-%dT%H:%M:%S'):
+        try:
+            return int(datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp())
+        except ValueError:
+            continue
+    return None
+
+
 async def find_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
     if len(args) < 3:
         await update.message.reply_text(
-            "Usage: `/find <contract> <invested> <sold>`\n"
-            "Example: `/find 0xf280b16ef293d8e534e370794ef26bf312694126 0.5 2.3`",
+            "Usage: `/find <contract> <invested> <sold> [since:<window>]`\n"
+            "Example: `/find 0xf280b16e… 0.5 2.3`\n"
+            "         `/find 0xf280b16e… 0.5 2.3 since:30d`\n"
+            "         `/find 0xf280b16e… 0.5 2.3 since:2026-03-01`\n\n"
+            "`since:` optional — defaults to all-time scan (capped at 20K most-recent swaps).\n"
+            "Use it on very-active tokens to bound the search window.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -203,12 +235,29 @@ async def find_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if iv is None or sv is None:
         await update.message.reply_text("Couldn't parse the amounts. Try `0.5` or `$500`.")
         return
-    await _run_match(update, ctx, token, iu, iv, su, sv)
+
+    # Optional since:<window> flag (anywhere after the required args)
+    since_ts = None
+    for extra in args[3:]:
+        if extra.lower().startswith('since:'):
+            since_ts = _parse_since(extra.split(':', 1)[1])
+            if since_ts is None:
+                await update.message.reply_text(
+                    f"Couldn't parse `{extra}`. Use e.g. `since:7d`, `since:30d`, `since:2026-04-01`.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+    await _run_match(update, ctx, token, iu, iv, su, sv, since_ts=since_ts)
 
 
-async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val):
+async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val, since_ts=None):
+    win_label = ''
+    if since_ts:
+        days = (datetime.now(timezone.utc).timestamp() - since_ts) / 86400
+        win_label = f' (last {days:.0f}d)'
     status = await update.message.reply_text(
-        f"⏳ Scanning {fmt_short(token)} on Uniswap… (10–90 s)"
+        f"⏳ Scanning {fmt_short(token)}{win_label}… (10–90 s)"
     )
 
     loop = asyncio.get_running_loop()
@@ -219,7 +268,9 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val)
             eth_price = get_eth_price_usd()
         inv_eth = inv_val / eth_price if inv_unit == 'usd' else inv_val
         sold_eth = sold_val / eth_price if sold_unit == 'usd' else sold_val
-        results, pairs, filt = matcher.find_matches(token, inv_eth, sold_eth, top_n=5)
+        results, pairs, filt = matcher.find_matches(
+            token, inv_eth, sold_eth, top_n=5, since_ts=since_ts,
+        )
         return results, pairs, filt, inv_eth, sold_eth, eth_price
 
     try:
@@ -366,6 +417,78 @@ async def searchtimes_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---- /findwallet <token> <wallet> <invested> <sold>  -- direct verify (no scan) ----
+async def findwallet_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    args = ctx.args
+    if len(args) < 4:
+        await update.message.reply_text(
+            "Usage: `/findwallet <contract> <wallet> <invested> <sold>`\n"
+            "Verifies a specific wallet against your targets — fast & always accurate.\n"
+            "Example: `/findwallet 0xTOKEN 0xWALLET 0.5 2.3`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    wallet = args[1].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token) or not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("First two args must be 0x… addresses.")
+        return
+    iu, iv = parse_amount(args[2])
+    su, sv = parse_amount(args[3])
+    if iv is None or sv is None:
+        await update.message.reply_text("Couldn't parse amounts. Try `0.5` or `$500`.")
+        return
+
+    status = await update.message.reply_text(
+        f"🎯 Verifying {fmt_short(wallet)} on {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        eth_price = get_eth_price_usd() if (iu == 'usd' or su == 'usd') else None
+        inv_eth = iv / eth_price if iu == 'usd' else iv
+        sold_eth = sv / eth_price if su == 'usd' else sv
+        totals = await loop.run_in_executor(None,
+            lambda: matcher.wallet_token_totals(token, wallet))
+    except Exception as e:
+        log.exception("findwallet error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if totals.get('n_buys', 0) + totals.get('n_sells', 0) == 0:
+        await status.edit_text(
+            f"❌ Moralis returned 0 swaps for `{wallet}` on this token.\n\n"
+            f"Possible: wrong contract, different chain, or trades older than the index window.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    ei = totals['eth_in']; eo = totals['eth_out']
+    inv_ok = abs(ei - inv_eth) / max(inv_eth, 1e-9) <= 0.05
+    sold_ok = abs(eo - sold_eth) / max(sold_eth, 1e-9) <= 0.05
+    pnl = eo - ei
+    icon_inv = '✅' if inv_ok else '❌'
+    icon_sold = '✅' if sold_ok else '❌'
+    overall = '🎯 *MATCH*' if (inv_ok and sold_ok) else '⚠️ *MISMATCH*'
+
+    lines = [
+        f"{overall}  `{wallet}`",
+        f"Token: `{fmt_short(token)}`",
+        "",
+        f"*Authoritative totals (Moralis):*",
+        f"  bought: {ei:.4f} ETH  (target {inv_eth:.4f}, {icon_inv})",
+        f"  sold:   {eo:.4f} ETH  (target {sold_eth:.4f}, {icon_sold})",
+        f"  pnl:    {pnl:+.4f} ETH",
+        f"  trades: {totals['n_buys']} buys / {totals['n_sells']} sells",
+        "",
+        f"[etherscan](https://etherscan.io/address/{wallet}) · "
+        f"[debank](https://debank.com/profile/{wallet}) · "
+        f"[gmgn](https://gmgn.ai/eth/address/{wallet})",
+    ]
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
 # ---- /debug <token> <wallet>  -- show what the matcher actually sees for this wallet ----
 async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     args = ctx.args
@@ -396,57 +519,51 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     is_c = info['is_contract']
-    direct_n = info['direct_n']
     totals = info.get('totals') or {}
+    native = info.get('native_label', 'ETH')
+    n_pools = info.get('n_pools_total', 0)
 
     lines = [
         f"🔍 *Debug* `{wallet}`",
         f"Token: `{fmt_short(token)}`",
         f"Is contract: {is_c}",
+        f"Pools seen: {n_pools}",
         "",
     ]
 
-    if direct_n == 0:
+    if totals.get('error'):
+        lines.append(f"⚠️ totals query failed: {totals['error']}")
+    elif (totals.get('n_buys', 0) + totals.get('n_sells', 0)) == 0:
         lines += [
-            "❌ Etherscan shows this wallet never moved this token on mainnet.",
+            f"❌ Moralis returned 0 swaps for this wallet on this token.",
             "",
             "Possible causes:",
             "• wrong contract address?",
-            "• wallet traded on another chain (Base / BSC / etc)?",
+            "• wallet traded on another chain (Base / BSC / Solana)?",
+            "• trades older than Moralis' history window for this token?",
         ]
-        await status.edit_text("\n".join(lines)[:4000],
-                               parse_mode=ParseMode.MARKDOWN,
-                               disable_web_page_preview=True)
-        return
-
-    if totals.get('error'):
-        lines.append(f"⚠️ totals query failed: {totals['error']}")
     else:
-        # wallet-centric totals (the authoritative numbers)
         pnl = totals['eth_out'] - totals['eth_in']
         lines += [
-            f"*Wallet-centric totals (authoritative):*",
-            f"  bought: *{totals['eth_in']:.4f} ETH* ({totals['n_buys']}×)",
-            f"  sold:   *{totals['eth_out']:.4f} ETH* ({totals['n_sells']}×)",
-            f"  pnl:    {pnl:+.4f} ETH",
-            f"  {direct_n} raw tokentx rows seen",
+            f"*Totals (authoritative — Moralis):*",
+            f"  bought: *{totals['eth_in']:.4f} {native}* ({totals['n_buys']}×)",
+            f"  sold:   *{totals['eth_out']:.4f} {native}* ({totals['n_sells']}×)",
+            f"  pnl:    {pnl:+.4f} {native}",
         ]
-
         trades = totals.get('trades') or []
         if trades:
             lines.append("")
             lines.append(f"_Trades ({len(trades)}):_")
             for t in trades[:15]:
-                lines.append(f"• {fmt_ts(t['ts'])}  {t['kind']:4} {t['eth']:.4f} ETH")
+                lines.append(f"• {fmt_ts(t['ts'])}  {t['kind']:4} {t['eth']:.4f} {native}")
 
-    # small pool-scan sanity at the bottom
+    # for-reference: token-scan view of this wallet (may be partial if very old)
     s = info.get('stats')
-    if s:
+    if s and (s.get('n_buys', 0) + s.get('n_sells', 0)) > 0:
         lines += [
             "",
-            f"_(for reference, pool-scan had: "
-            f"{s['eth_in']:.4f} in / {s['eth_out']:.4f} out — "
-            f"may be partial due to pool 10k-row cap)_",
+            f"_(token-scan: {s['eth_in']:.4f} in / {s['eth_out']:.4f} out — "
+            f"a subset of authoritative totals if wallet has older trades)_",
         ]
 
     text = "\n".join(lines)[:4000]
@@ -476,8 +593,8 @@ def start_health_server(port):
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var (from @BotFather).")
-    if not ETHERSCAN_KEY:
-        raise SystemExit("Set ETHERSCAN_API_KEY env var.")
+    if not MORALIS_KEY:
+        raise SystemExit("Set MORALIS_API_KEY env var (admin.moralis.com).")
 
     # Keep-alive HTTP endpoint — required by Render/UptimeRobot flow.
     port = int(os.environ.get('PORT') or 0)
@@ -489,6 +606,7 @@ def main():
     app.add_handler(CommandHandler('start', start_cmd))
     app.add_handler(CommandHandler('help', start_cmd))
     app.add_handler(CommandHandler('find', find_cmd))
+    app.add_handler(CommandHandler('findwallet', findwallet_cmd))
     app.add_handler(CommandHandler('searchtimes', searchtimes_cmd))
     app.add_handler(CommandHandler('debug', debug_cmd))
     app.add_handler(CommandHandler('clearcache', clearcache_cmd))
