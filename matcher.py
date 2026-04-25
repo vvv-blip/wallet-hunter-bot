@@ -499,8 +499,8 @@ class Matcher:
         return results[:top_n], pairs, len(stats)
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5,
-                     min_activity=True, tol=0.05, verify_top_k=20,
-                     verify_budget_seconds=60, chain='eth',
+                     min_activity=True, tol=0.05, verify_top_k=50,
+                     verify_budget_seconds=75, chain='eth',
                      since_ts=None, until_ts=None, scan_max_pages=200):
         """Return wallets within ±tol of both (invested, sold) targets.
 
@@ -571,6 +571,12 @@ class Matcher:
                     }
                 seeded_via_topgainers.add(addr)
 
+        # Asymmetric scoring: when one leg is 0 in the scan window (buy or sell
+        # happened outside the window), score only the visible leg + a small
+        # constant penalty.  This is critical so long-holders (eth_in=0,
+        # eth_out~target) and recent-buyers (eth_in~target, eth_out=0) surface
+        # near the top instead of being ranked last by log(eps).
+        SINGLE_LEG_PENALTY = 1.0  # ≈ a 2.7× miss on the unseen leg
         prefilter = []
         for wallet, s in stats.items():
             if s['n_buys'] + s['n_sells'] == 0:
@@ -579,9 +585,19 @@ class Matcher:
                 continue
             if sold_eth > 0 and s['eth_out'] > max(sold_eth * 10, 10) + 1:
                 continue
-            rel = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps)))
-            if sold_eth > 0:
-                rel += abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+            has_in = s['eth_in'] > 0
+            has_out = s['eth_out'] > 0
+            score_in = abs(math.log((s['eth_in'] + eps) / (invested_eth + eps))) if has_in else None
+            score_out = (abs(math.log((s['eth_out'] + eps) / (sold_eth + eps)))
+                         if (sold_eth > 0 and has_out) else None)
+            if score_in is not None and score_out is not None:
+                rel = score_in + score_out
+            elif score_in is not None:
+                rel = score_in + SINGLE_LEG_PENALTY
+            elif score_out is not None:
+                rel = score_out + SINGLE_LEG_PENALTY
+            else:
+                continue  # neither leg gives signal
             prefilter.append((rel, wallet, s))
         prefilter.sort(key=lambda x: x[0])
 
@@ -592,6 +608,7 @@ class Matcher:
             'inv_ok': 0,
             'sell_ok': 0,
             'top_gainers_seeded': len(seeded_via_topgainers),
+            'single_leg': 0,
         }
 
         # Always-verify wallets already matching ±tol on aggregate stats.
@@ -601,9 +618,34 @@ class Matcher:
                 if sold_eth == 0 or (s['eth_out'] > 0 and sold_lo <= s['eth_out'] <= sold_hi):
                     must_verify.add(wallet)
 
-        verify_set = list(must_verify)
-        for _, wallet, _ in prefilter:
+        # Single-leg-close set: wallets where ONE leg lands within ±20% of
+        # target.  These are very likely candidates whose other leg is just
+        # outside the scan window — exactly the case where verifying via
+        # wallet-centric lifetime totals is needed.
+        single_leg_set = set()
+        wide_lo_inv, wide_hi_inv = invested_eth * 0.8, invested_eth * 1.2
+        wide_lo_out = sold_eth * 0.8 if sold_eth > 0 else 0
+        wide_hi_out = sold_eth * 1.2 if sold_eth > 0 else 0
+        for _, wallet, s in prefilter:
             if wallet in must_verify:
+                continue
+            inv_close = wide_lo_inv <= s['eth_in'] <= wide_hi_inv
+            sold_close = sold_eth > 0 and wide_lo_out <= s['eth_out'] <= wide_hi_out
+            if inv_close or sold_close:
+                single_leg_set.add(wallet)
+        filt['single_leg'] = len(single_leg_set)
+
+        # Auto-verify all top-gainers seeded wallets — leaderboard-rank already
+        # implies they're high-PnL, finite cost (≤100 wallets).
+        verify_set = list(must_verify)
+        for w in seeded_via_topgainers:
+            if w not in must_verify and w not in verify_set:
+                verify_set.append(w)
+        for w in single_leg_set:
+            if w not in must_verify and w not in verify_set:
+                verify_set.append(w)
+        for _, wallet, _ in prefilter:
+            if wallet in must_verify or wallet in seeded_via_topgainers or wallet in single_leg_set:
                 continue
             if len(verify_set) >= verify_top_k:
                 break

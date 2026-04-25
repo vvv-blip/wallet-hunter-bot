@@ -289,11 +289,13 @@ async def _run_match(update, ctx, token, inv_unit, inv_val, sold_unit, sold_val,
             f"({inv_eth:.4f} ETH bought / {sold_eth:.4f} ETH sold).\n\n"
             f"Filter funnel:\n"
             f"• {filt.get('total', 0)} pool-scan wallets\n"
-            f"• {filt.get('prefilter', 0)} in loose prefilter (within 5× of target)\n"
+            f"• {filt.get('prefilter', 0)} in loose prefilter (within 10× of target)\n"
+            f"• {filt.get('top_gainers_seeded', 0)} added from PnL leaderboard\n"
+            f"• {filt.get('single_leg', 0)} flagged as single-leg-close (one leg ±20%)\n"
             f"• {filt.get('verified', 0)} verified via wallet-centric totals\n"
             f"• {filt.get('inv_ok', 0)} within ±5% on invested\n"
             f"• {filt.get('sell_ok', 0)} also within ±5% on sold\n\n"
-            f"If you know a specific wallet, try `/debug {token} <wallet>` to inspect it.",
+            f"If you know a specific wallet, try `/findwallet {token} <wallet> {inv_eth} {sold_eth}` to verify it directly.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
