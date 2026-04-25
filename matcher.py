@@ -1,19 +1,29 @@
-"""Wallet match logic, backed by Moralis decoded-swaps APIs.
+"""Wallet match logic — free-API stack (Etherscan v2 + GeckoTerminal).
 
-For every (token, wallet) pair we fetch already-decoded swap rows from Moralis:
-  - token-level scan       -> /erc20/{token}/swaps          (or Solana equivalent)
-  - per-wallet exact totals -> /wallets/{wallet}/swaps       (or Solana equivalent)
+Pivoted off Moralis after credit burn on hyper-active tokens.  The default
+trade-history backend is now:
+  - Token-wide discovery       -> GeckoTerminal token_trades (free, no key)
+                                   + optional Etherscan tokentx for deep history
+  - Per-wallet exact totals    -> EtherscanSource.wallet_token_totals
+                                   (tokentx + WETH-leg + internal-tx reconstruction)
 
-Moralis returns each swap with the wallet that signed, the bought/sold legs
-(amount + symbol + USD), the pair address, and the DEX name.  This works
-across every Uniswap version (incl. V4 singleton pools), Sushi, Curve, etc.,
-and on Solana across Raydium, Orca, Meteora, Jupiter aggregator, Pump.fun, etc.
+Moralis is now OPTIONAL.  If MORALIS_API_KEY is set, it's only used as a
+fast-path for `wallet_token_totals` on a per-call basis (no token-wide
+scans → that's where credits got burned).  When the key is absent, the bot
+runs entirely on free APIs.
 
-The chain layer is a thin dict, so adding Solana later is a 5-line change.
+The chain layer is still a thin dict so Solana support is a small change.
 """
 import os, time, json, math, requests
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# Optional sources layer — gracefully degrades if files missing.
+try:
+    from sources import Cache, GTSource, EtherscanSource
+    _SOURCES_AVAILABLE = True
+except Exception:
+    _SOURCES_AVAILABLE = False
 
 # ---- chain config -----------------------------------------------------------
 
@@ -49,10 +59,17 @@ class Matcher:
         self.cache_dir = cache_dir
         self.cache_ttl = cache_ttl
         os.makedirs(cache_dir, exist_ok=True)
-        if not moralis_key:
-            # Not fatal — caller can still hit get_pairs / pricing endpoints.
-            # But anything that needs trade history will return empty.
-            pass
+
+        # New sources layer — instantiated once, shared across all calls.
+        # Falls back to legacy code paths if the import failed.
+        if _SOURCES_AVAILABLE:
+            self.cache = Cache(cache_dir, default_ttl=cache_ttl)
+            self.gt = GTSource(self.cache)
+            self.es = EtherscanSource(etherscan_key, self.cache) if etherscan_key else None
+        else:
+            self.cache = None
+            self.gt = None
+            self.es = None
 
     # ---- cache helpers -----------------------------------------------------
     def _cache_path(self, key):
@@ -463,78 +480,135 @@ class Matcher:
     # ---- main pipeline ----------------------------------------------------
     def build_wallet_stats(self, token, chain='eth', trace_wallet=None,
                            max_pages=200, since_ts=None, until_ts=None):
-        """Aggregate per-wallet stats from Moralis token-swaps.
+        """Aggregate per-wallet stats from token-wide trade flow.
+
+        DEFAULT: GT trades (free, ~5K most-recent across top 15 pools).
+        If MORALIS_API_KEY is set AND the user opts in via env
+        WALLET_BOT_USE_MORALIS=1, falls through to the legacy Moralis path
+        (deeper history but burns paid credits — disabled by default).
+
         Returns ({wallet: stats}, pools[, trace]) when trace_wallet given.
-        `pools` is filled from DexScreener for display only (we no longer scan them).
-
-        `since_ts` / `until_ts` (unix seconds) bound the scan window.  Default
-        is no bound, capped only by max_pages (200 = up to 20k swaps).
         """
-        if not self.mk:
+        twl = (trace_wallet or '').lower()
+        use_moralis = (self.mk and os.environ.get('WALLET_BOT_USE_MORALIS') == '1'
+                       and chain == 'eth')
+
+        # Legacy Moralis path — only when explicitly opted in.
+        if use_moralis:
+            swaps = self.token_swaps(token, chain=chain, max_pages=max_pages,
+                                     since_ts=since_ts, until_ts=until_ts)
+            pool_idx = {}
+            for sw in swaps:
+                pa = sw.get('pair_addr')
+                if not pa: continue
+                pool_idx.setdefault(pa, {
+                    'addr': pa,
+                    'name': sw.get('pair_label') or '',
+                    'dex': sw.get('exchange') or '',
+                    'liquidity_usd': 0.0,
+                })
+            if chain == 'eth':
+                ds = self.get_pairs(token)
+                ds_by = {p['addr']: p for p in ds}
+                for addr, info in pool_idx.items():
+                    if addr in ds_by:
+                        info['liquidity_usd'] = ds_by[addr]['liquidity_usd']
+            pools = sorted(pool_idx.values(), key=lambda x: -x['liquidity_usd'])
+            stats = defaultdict(self._empty_stats)
+            trace = []
+            for sw in swaps:
+                self._add_swap_to_stats(stats, sw)
+                if twl and sw['wallet'] == twl:
+                    trace.append({**sw, 'source': 'moralis_token'})
+            if trace_wallet:
+                return dict(stats), pools, trace
+            return dict(stats), pools
+
+        # Default: GT-only token-wide scan (free, no key, parallel pools).
+        if not self.gt or chain != 'eth':
             return ({}, [], []) if trace_wallet else ({}, [])
+        gt_trades = self.gt.token_trades(token, network='eth', n_pools=15)
+        # Optionally bound by since_ts (until_ts) — GT data is freshness-biased
+        if since_ts:
+            gt_trades = [t for t in gt_trades if (t.get('ts') or 0) >= since_ts]
+        if until_ts:
+            gt_trades = [t for t in gt_trades if (t.get('ts') or 0) <= until_ts]
 
-        swaps = self.token_swaps(token, chain=chain, max_pages=max_pages,
-                                 since_ts=since_ts, until_ts=until_ts)
-
-        # build pools list from observed swaps (deduped by pair_addr) so we have
-        # a reasonable display even if DexScreener hasn't indexed yet
-        pool_idx = {}
-        for sw in swaps:
-            pa = sw.get('pair_addr')
-            if not pa: continue
-            pool_idx.setdefault(pa, {
-                'addr': pa,
-                'name': sw.get('pair_label') or '',
-                'dex': sw.get('exchange') or '',
-                'liquidity_usd': 0.0,
-            })
-
-        # enrich with dexscreener liquidity for display (eth only)
-        if chain == 'eth':
-            ds = self.get_pairs(token)
-            ds_by = {p['addr']: p for p in ds}
-            for addr, info in pool_idx.items():
-                if addr in ds_by:
-                    info['liquidity_usd'] = ds_by[addr]['liquidity_usd']
-
-        pools = sorted(pool_idx.values(), key=lambda x: -x['liquidity_usd'])
+        # Build pools list (display only) from DexScreener for liquidity info.
+        ds = self.get_pairs(token) if chain == 'eth' else []
+        pools = ds[:20]
 
         stats = defaultdict(self._empty_stats)
         trace = []
-        twl = (trace_wallet or '').lower()
-        for sw in swaps:
+        for tr in gt_trades:
+            sw = {
+                'wallet': tr['wallet'],
+                'kind': tr['kind'],
+                'eth': tr['eth'],
+                'usd': tr.get('usd', 0),
+                'ts': tr['ts'],
+                'hash': tr.get('tx_hash', ''),
+            }
             self._add_swap_to_stats(stats, sw)
             if twl and sw['wallet'] == twl:
-                trace.append({**sw, 'source': 'moralis_token'})
+                trace.append({**sw, 'source': 'gt_token'})
 
         if trace_wallet:
             return dict(stats), pools, trace
         return dict(stats), pools
 
     def wallet_token_totals(self, token, wallet, chain='eth'):
-        """Exact buy/sell totals for (wallet, token).  Returns dict with
-        eth_in/eth_out/n_buys/n_sells/buy_ts/sell_ts/trades."""
-        swaps = self.wallet_swaps(wallet, token, chain=chain, max_pages=10)
-        eth_in = eth_out = 0.0
-        n_buys = n_sells = 0
-        buy_ts, sell_ts = [], []
-        trades = []
-        for sw in swaps:
-            if sw['kind'] == 'buy':
-                eth_in += sw['eth']; n_buys += 1
-                buy_ts.append(sw['ts'])
-            else:
-                eth_out += sw['eth']; n_sells += 1
-                sell_ts.append(sw['ts'])
-            trades.append({'kind': sw['kind'], 'ts': sw['ts'],
-                           'eth': sw['eth'], 'usd': sw.get('usd', 0),
-                           'hash': sw['hash']})
+        """Exact buy/sell totals for (wallet, token).
+
+        Backend selection:
+          1. Etherscan (free, default) — full historical via tokentx + WETH-leg
+             reconstruction.  Authoritative, ~600ms/wallet rate-limited.
+          2. Moralis (only if WALLET_BOT_USE_MORALIS=1 + key present).
+          3. Empty stub if neither is available.
+        """
+        use_moralis = (self.mk and os.environ.get('WALLET_BOT_USE_MORALIS') == '1'
+                       and chain == 'eth')
+        if use_moralis:
+            swaps = self.wallet_swaps(wallet, token, chain=chain, max_pages=10)
+            eth_in = eth_out = 0.0
+            n_buys = n_sells = 0
+            buy_ts, sell_ts = [], []
+            trades = []
+            for sw in swaps:
+                if sw['kind'] == 'buy':
+                    eth_in += sw['eth']; n_buys += 1
+                    buy_ts.append(sw['ts'])
+                else:
+                    eth_out += sw['eth']; n_sells += 1
+                    sell_ts.append(sw['ts'])
+                trades.append({'kind': sw['kind'], 'ts': sw['ts'],
+                               'eth': sw['eth'], 'usd': sw.get('usd', 0),
+                               'hash': sw['hash']})
+            return {
+                'eth_in': eth_in, 'eth_out': eth_out,
+                'n_buys': n_buys, 'n_sells': n_sells,
+                'buy_ts': buy_ts, 'sell_ts': sell_ts,
+                'trades': trades,
+                'n_swaps': len(swaps),
+                'source': 'moralis',
+            }
+
+        # Default: Etherscan reconstruction (free, full history).
+        if self.es and chain == 'eth':
+            try:
+                t = self.es.wallet_token_totals(wallet, token)
+                t['source'] = 'etherscan'
+                return t
+            except Exception:
+                pass
+
+        # Last resort: empty stub
         return {
-            'eth_in': eth_in, 'eth_out': eth_out,
-            'n_buys': n_buys, 'n_sells': n_sells,
-            'buy_ts': buy_ts, 'sell_ts': sell_ts,
-            'trades': trades,
-            'n_swaps': len(swaps),
+            'eth_in': 0.0, 'eth_out': 0.0,
+            'n_buys': 0, 'n_sells': 0,
+            'buy_ts': [], 'sell_ts': [], 'trades': [],
+            'n_swaps': 0,
+            'source': 'unavailable',
         }
 
     def debug_wallet(self, token, wallet, chain='eth'):
@@ -627,9 +701,12 @@ class Matcher:
         # weren't necessarily caught by the recent-swaps scan, so always include
         # them as candidates if their pre-aggregated USD totals are roughly in
         # range.  Verification step will compute exact ETH totals.
+        # Skipped unless explicitly opted in (burns Moralis credits).
         eth_price_proxy = None  # lazy
         seeded_via_topgainers = set()
-        if chain == 'eth':
+        use_moralis = (self.mk and os.environ.get('WALLET_BOT_USE_MORALIS') == '1'
+                       and chain == 'eth')
+        if use_moralis:
             try:
                 tg = self.token_top_gainers(token, chain=chain)
             except Exception:

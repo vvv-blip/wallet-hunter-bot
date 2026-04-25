@@ -20,6 +20,9 @@ from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 
 from matcher import Matcher, get_eth_price_usd
+from sources import Cache, GTSource, EtherscanSource
+from quality import WalletQualityScorer
+from discovery import Discovery
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 log = logging.getLogger('walletbot')
@@ -30,6 +33,13 @@ MORALIS_KEY = os.environ.get('MORALIS_API_KEY') or ''
 CACHE_DIR = os.environ.get('BOT_CACHE_DIR', '/tmp/wallet_bot_cache')
 
 matcher = Matcher(etherscan_key=ETHERSCAN_KEY, moralis_key=MORALIS_KEY, cache_dir=CACHE_DIR)
+
+# Shared sources/quality/discovery instances (reuse Matcher's cache+sources).
+_cache = matcher.cache or Cache(CACHE_DIR)
+_gt = matcher.gt or GTSource(_cache)
+_es = matcher.es or EtherscanSource(ETHERSCAN_KEY, _cache) if ETHERSCAN_KEY else None
+_scorer = WalletQualityScorer(_es, _gt, _cache) if _es else WalletQualityScorer(None, _gt, _cache)
+_disc = Discovery(_es, _gt, _cache)
 
 # ---- parsing ----
 AMOUNT_RE = re.compile(r'^\s*\$?\s*([0-9]*\.?[0-9]+)\s*(eth|weth|usd|usdc|\$)?\s*$', re.I)
@@ -98,27 +108,32 @@ WAIT_CONTRACT, WAIT_INVEST, WAIT_SOLD = range(3)
 
 async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔎 *Wallet Hunter Bot*\n\n"
-        "Find wallets that traded a token with footprints similar to yours.\n\n"
-        "*By amounts:*\n"
-        "`/find 0xTOKEN 0.5 2.3`\n"
-        "(bought 0.5 ETH, sold 2.3 ETH — matches within ±5%)\n"
-        "Or in USD: `/find 0xTOKEN $500 $2300`\n\n"
+        "🔎 *Wallet Hunter Bot* — find smart wallets, dodge bots/sybils/ruggers.\n\n"
+        "*Match by amounts (PnL-card style):*\n"
+        "`/find 0xTOKEN 0.5 2.3` — wallets that bought 0.5 ETH, sold 2.3 ETH (±5%)\n"
+        "`/findsmart 0xTOKEN 0.5 2.3` — same as /find, but only *quality-scored* "
+        "wallets (real humans, not bots)\n\n"
+        "*Discover top traders on a token:*\n"
+        "`/topwallets 0xTOKEN` — leaderboard by realized PnL\n"
+        "`/earlybuyers 0xTOKEN` — first wallets to ever buy this token\n"
+        "`/diamondhands 0xTOKEN` — bought and held 14+ days\n"
+        "`/prepump 0xTOKEN` — wallets that bought *before* the first 5x pump\n"
+        "`/soldnear 0xTOKEN` — wallets that sold within 80% of the all-time peak\n\n"
+        "*Profile / follow a wallet:*\n"
+        "`/profile 0xWALLET` — quality score + signals (age, funding, bot/rug flags)\n"
+        "`/copytrade 0xWALLET` — what is this wallet currently buying?\n"
+        "`/clones 0xWALLET` — wallets sharing the same funding source (sybil check)\n\n"
         "*By time windows:*\n"
         "`/searchtimes 0xTOKEN <minBuy> <maxBuy> <minSell> <maxSell>`\n"
-        "Dates: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, or unix seconds. "
-        "Use `_` for an open bound.\n"
-        "Example: `/searchtimes 0xTOKEN 2026-03-01 2026-03-15 2026-04-01 2026-04-20`\n\n"
+        "Use `_` for an open bound. Example: "
+        "`/searchtimes 0xTOKEN 2026-03-01 2026-03-15 2026-04-01 2026-04-20`\n\n"
+        "*Direct verify:*\n"
+        "`/findwallet 0xTOKEN 0xWALLET <invested> <sold>` — verify a specific wallet\n"
+        "`/debug 0xTOKEN 0xWALLET` — show every trade for a wallet on a token\n\n"
         "*Step-by-step amount search:*\n"
-        "`/hunt`   → I'll ask you 3 questions.\n\n"
-        "*Diagnostics:*\n"
-        "`/debug 0xTOKEN 0xWALLET` — show every buy/sell for one wallet "
-        "(use when a wallet you expect isn't appearing).\n"
-        "`/findwallet 0xTOKEN 0xWALLET <invested> <sold>` — verify if a specific "
-        "wallet matches your targets. Fast & always accurate, no scan needed.\n\n"
+        "`/hunt` → I'll ask you 3 questions.\n\n"
         "*Tips:*\n"
-        "On very-active tokens, scanning all swaps is slow. Add `since:30d` or "
-        "`since:2026-04-01` to bound the look-back window:\n"
+        "Add `since:30d` or `since:2026-04-01` to /find to narrow the scan window:\n"
         "`/find 0xTOKEN 0.5 2.3 since:7d`\n\n"
         "*Other:*\n"
         "`/help` — show this\n"
@@ -576,6 +591,540 @@ async def debug_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await status.edit_text(text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# NEW COMMANDS — quality scoring + discovery patterns
+# ════════════════════════════════════════════════════════════════════════════
+
+def _fmt_quality_block(q):
+    """Compact rendering of a quality score for /profile and /findsmart."""
+    rating_emoji = {
+        'avoid': '🚨', 'risky': '⚠️', 'normal': '🟡',
+        'good': '🟢', 'great': '⭐', 'elite': '💎',
+        'unknown': '❔',
+    }.get(q.get('rating', 'unknown'), '❔')
+    lines = [
+        f"{rating_emoji} *{q.get('rating', 'unknown').upper()}* "
+        f"({q.get('overall', 0):.0f}/100)",
+    ]
+    sub = q.get('subscores') or {}
+    if sub:
+        lines.append(
+            f"  age {sub.get('age', 0):.0f} · "
+            f"div {sub.get('diversity', 0):.0f} · "
+            f"fund {sub.get('funding', 0):.0f} · "
+            f"rug {sub.get('rug_avoid', 0):.0f} · "
+            f"bot {sub.get('bot_avoid', 0):.0f} · "
+            f"act {sub.get('activity', 0):.0f}"
+        )
+    flags = q.get('flags') or []
+    for f in flags[:5]:
+        lines.append(f"  {f}")
+    return "\n".join(lines)
+
+
+async def profile_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Quality breakdown for one wallet."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/profile <wallet>`\n"
+            "Shows quality score: age, token diversity, funding source, "
+            "bot/sybil/rug flags.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    wallet = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("Arg must be a 0x… wallet address.")
+        return
+
+    status = await update.message.reply_text(
+        f"🔬 Profiling {fmt_short(wallet)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        q = await loop.run_in_executor(None, lambda: _scorer.score(wallet))
+    except Exception as e:
+        log.exception("profile error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    meta = q.get('meta') or {}
+    lines = [
+        f"🔬 *Profile* `{wallet}`",
+        "",
+        _fmt_quality_block(q),
+    ]
+    if meta:
+        lines += ["", "*Raw signals:*"]
+        if meta.get('age_days') is not None:
+            lines.append(f"  • age: {meta['age_days']:.0f} days")
+        if meta.get('distinct_tokens_90d') is not None:
+            lines.append(f"  • distinct tokens 90d: {meta['distinct_tokens_90d']}")
+        if meta.get('funding_label'):
+            lines.append(f"  • funded by: {meta['funding_label']}")
+        if meta.get('deployed_contracts') is not None:
+            lines.append(f"  • contracts deployed: {meta['deployed_contracts']}")
+        if meta.get('tx_count_30d') is not None:
+            lines.append(f"  • txs (30d): {meta['tx_count_30d']}")
+        if meta.get('mev_builder_uses') is not None:
+            lines.append(f"  • MEV-builder uses: {meta['mev_builder_uses']}")
+        if meta.get('avg_hold_days') is not None:
+            lines.append(f"  • avg hold: {meta['avg_hold_days']:.1f}d")
+    lines += [
+        "",
+        f"[etherscan](https://etherscan.io/address/{wallet}) · "
+        f"[debank](https://debank.com/profile/{wallet}) · "
+        f"[gmgn](https://gmgn.ai/eth/address/{wallet})",
+    ]
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def findsmart_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Same as /find but only quality-scored wallets."""
+    args = ctx.args
+    if len(args) < 3:
+        await update.message.reply_text(
+            "Usage: `/findsmart <contract> <invested> <sold> [since:<window>]`\n"
+            "Like /find, but enriches each result with a quality score and "
+            "filters out bots/sybils/ruggers.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    iu, iv = parse_amount(args[1])
+    su, sv = parse_amount(args[2])
+    if iv is None or sv is None:
+        await update.message.reply_text("Couldn't parse amounts.")
+        return
+
+    since_ts = None
+    for extra in args[3:]:
+        if extra.lower().startswith('since:'):
+            since_ts = _parse_since(extra.split(':', 1)[1])
+
+    status = await update.message.reply_text(
+        f"🧠 Scanning {fmt_short(token)} for quality matches… (15–60s)"
+    )
+    loop = asyncio.get_running_loop()
+
+    def work():
+        eth_price = None
+        if iu == 'usd' or su == 'usd':
+            eth_price = get_eth_price_usd()
+        inv_eth = iv / eth_price if iu == 'usd' else iv
+        sold_eth = sv / eth_price if su == 'usd' else sv
+        results, pairs, filt = matcher.find_matches(
+            token, inv_eth, sold_eth, top_n=15, since_ts=since_ts,
+        )
+        # Enrich with quality scores
+        enriched = []
+        for r in results:
+            try:
+                q = _scorer.score(r['wallet'])
+            except Exception:
+                q = {'overall': 50, 'rating': 'unknown', 'flags': [], 'subscores': {}}
+            r2 = {**r, 'quality': q}
+            # Composite: dist (lower=better) + (100-quality)/50 (lower=better)
+            r2['composite'] = r['dist'] + (100 - q.get('overall', 50)) / 50.0
+            enriched.append(r2)
+        enriched.sort(key=lambda r: r['composite'])
+        return enriched[:5], pairs, filt, inv_eth, sold_eth, eth_price
+
+    try:
+        results, pairs, filt, inv_eth, sold_eth, eth_price = await loop.run_in_executor(None, work)
+    except Exception as e:
+        log.exception("findsmart error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(
+            f"❌ No quality wallets matched ±5% on both legs.\n"
+            f"Funnel: {filt.get('total', 0)} scan → "
+            f"{filt.get('verified', 0)} verified → "
+            f"{filt.get('sell_ok', 0)} match.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    eth_price = eth_price or get_eth_price_usd()
+    lines = [
+        f"🧠 *Quality matches for* `{fmt_short(token)}`",
+        f"_Target: {inv_eth:.4f} ETH bought · {sold_eth:.4f} ETH sold_",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        pnl = r['pnl_eth']
+        roi = (pnl / r['invested_eth'] * 100) if r['invested_eth'] > 0.00001 else 0
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   bought: {r['invested_eth']:.4f} ETH ({r['n_buys']}×) · "
+            f"sold: {r['sold_eth']:.4f} ETH ({r['n_sells']}×)\n"
+            f"   pnl: {pnl:+.4f} ETH ({roi:+.0f}%)\n"
+            f"{_fmt_quality_block(r['quality'])}\n"
+            f"   [etherscan](https://etherscan.io/address/{r['wallet']}) · "
+            f"[debank](https://debank.com/profile/{r['wallet']})"
+        )
+        lines.append("")
+
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def topwallets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Top traders by realized PnL on a token."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/topwallets <contract>`\nLeaderboard by realized PnL.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+
+    status = await update.message.reply_text(
+        f"🏆 Loading top traders for {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.top_traders_by_pnl(token, top_n=10))
+    except Exception as e:
+        log.exception("topwallets error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(
+            "❌ No trades found. Token may be inactive or unindexed by GT.")
+        return
+
+    eth_price = get_eth_price_usd()
+    lines = [
+        f"🏆 *Top traders by PnL* — `{fmt_short(token)}`",
+        f"_(realized — visible recent trades only)_",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        pnl = r['pnl_eth']
+        roi = r.get('roi', 0) * 100
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   in: {r['eth_in']:.3f} ETH ({r['n_buys']}×) · "
+            f"out: {r['eth_out']:.3f} ETH ({r['n_sells']}×)\n"
+            f"   pnl: {pnl:+.3f} ETH (${pnl*eth_price:+,.0f}, {roi:+.0f}%)\n"
+            f"   [etherscan](https://etherscan.io/address/{r['wallet']})"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def earlybuyers_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """First N unique wallets to buy a token (insider detection)."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/earlybuyers <contract>`\nFirst wallets to buy this token.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    if not _es:
+        await update.message.reply_text(
+            "❌ Needs ETHERSCAN_API_KEY for full transfer history (free tier).")
+        return
+
+    status = await update.message.reply_text(
+        f"⏳ Walking history of {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.early_buyers(token, limit=20))
+    except Exception as e:
+        log.exception("earlybuyers error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text("❌ No early buyers found.")
+        return
+
+    lines = [f"🎯 *Early buyers* — `{fmt_short(token)}`", ""]
+    for i, r in enumerate(results, 1):
+        ts = fmt_ts(r.get('first_buy_ts', 0))
+        eth = r.get('eth_at_first_buy')
+        eth_str = f"{eth:.4f} ETH" if eth else "unknown ETH amount"
+        lines.append(
+            f"*#{i}* {ts}  `{r['wallet']}`\n"
+            f"   first buy: {eth_str}"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def diamondhands_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Wallets that bought and held."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/diamondhands <contract> [min_days=14]`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    min_days = 14
+    if len(args) >= 2:
+        try: min_days = int(args[1])
+        except: pass
+    if not _es:
+        await update.message.reply_text(
+            "❌ Needs ETHERSCAN_API_KEY for full transfer history.")
+        return
+
+    status = await update.message.reply_text(
+        f"💎 Looking for diamond hands on {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.diamond_hands(token, min_hold_days=min_days, top_n=15))
+    except Exception as e:
+        log.exception("diamondhands error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(f"❌ No wallets held ≥{min_days} days.")
+        return
+
+    lines = [f"💎 *Diamond hands* — `{fmt_short(token)}` (≥{min_days}d)", ""]
+    for i, r in enumerate(results, 1):
+        held = r.get('current_held', 0)
+        hold_d = r.get('hold_days', 0)
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   holds: {held:,.0f} tokens · {hold_d:.0f}d"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def prepump_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Wallets that bought before the first big pump."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/prepump <contract> [multiple=5]`\n"
+            "Wallets that bought before first {N}x pump in 24h.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    mult = 5.0
+    if len(args) >= 2:
+        try: mult = float(args[1])
+        except: pass
+
+    status = await update.message.reply_text(
+        f"🚀 Locating pump on {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.pre_pump_buyers(token, pump_multiple=mult))
+    except Exception as e:
+        log.exception("prepump error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(
+            f"❌ No {mult:.0f}x pump detected, or no buyers before it.")
+        return
+
+    lines = [f"🚀 *Pre-pump buyers* — `{fmt_short(token)}` (>{mult:.0f}x)", ""]
+    for i, r in enumerate(results[:20], 1):
+        lines.append(
+            f"*#{i}* {fmt_ts(r.get('first_buy_ts', 0))}  `{r['wallet']}`"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def soldnear_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Wallets that sold within 80% of all-time peak."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/soldnear <contract> [threshold=0.8]`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    threshold = 0.8
+    if len(args) >= 2:
+        try: threshold = float(args[1])
+        except: pass
+
+    status = await update.message.reply_text(
+        f"📈 Finding peak-sellers on {fmt_short(token)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.sold_near_top(token, threshold=threshold, top_n=15))
+    except Exception as e:
+        log.exception("soldnear error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(
+            f"❌ No sells within {threshold*100:.0f}% of peak found in recent trades.")
+        return
+
+    lines = [f"📈 *Sold near top* — `{fmt_short(token)}` (≥{threshold*100:.0f}% of peak)", ""]
+    for i, r in enumerate(results, 1):
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   peak sells: {r.get('top_eth_out', 0):.3f} ETH ({r.get('n_top_sells', 0)}×)"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def copytrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """What is this wallet recently buying?"""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/copytrade <wallet> [days=7]`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    wallet = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("First arg must be a 0x… wallet.")
+        return
+    days = 7
+    if len(args) >= 2:
+        try: days = int(args[1])
+        except: pass
+    if not _es:
+        await update.message.reply_text(
+            "❌ Needs ETHERSCAN_API_KEY for wallet trade history.")
+        return
+
+    status = await update.message.reply_text(
+        f"👀 Reading recent buys for {fmt_short(wallet)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.copytrade(wallet, days=days, top_n=15))
+    except Exception as e:
+        log.exception("copytrade error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text(
+            f"❌ No recent net-buys (last {days}d) — wallet may be selling or inactive.")
+        return
+
+    lines = [f"👀 *Copytrade* `{wallet}` (last {days}d)", ""]
+    for i, r in enumerate(results, 1):
+        sym = r.get('token_symbol') or '?'
+        addr = r.get('token_addr')
+        net = r.get('net_received', 0)
+        lines.append(
+            f"*#{i}* {sym}  `{addr}`\n"
+            f"   net bought: {net:,.0f} · last: {fmt_ts(r.get('last_buy_ts', 0))}"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
+async def clones_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Wallets sharing a funding source — sybil/cluster detection."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/clones <wallet>`\n"
+            "Wallets funded by the same source as the input wallet.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    wallet = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("First arg must be a 0x… wallet.")
+        return
+    if not _es:
+        await update.message.reply_text(
+            "❌ Needs ETHERSCAN_API_KEY for funding source lookup.")
+        return
+
+    status = await update.message.reply_text(
+        f"🧬 Looking for clones of {fmt_short(wallet)}…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.clones(wallet, top_n=15))
+    except Exception as e:
+        log.exception("clones error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if isinstance(results, dict) and results.get('reason'):
+        await status.edit_text(f"ℹ️ {results['reason']}")
+        return
+    if not results:
+        await status.edit_text("❌ No clones found.")
+        return
+
+    lines = [f"🧬 *Clones of* `{wallet}`", ""]
+    for i, r in enumerate(results, 1):
+        eth = r.get('eth_received_from_funder', 0)
+        lines.append(
+            f"*#{i}*  `{r['wallet']}`\n"
+            f"   funded: {fmt_ts(r.get('first_funded_ts', 0))} · "
+            f"received: {eth:.3f} ETH"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -599,8 +1148,12 @@ def start_health_server(port):
 def main():
     if not TELEGRAM_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN env var (from @BotFather).")
-    if not MORALIS_KEY:
-        raise SystemExit("Set MORALIS_API_KEY env var (admin.moralis.com).")
+    # Moralis is now optional — only required if WALLET_BOT_USE_MORALIS=1.
+    # Free-API stack (Etherscan v2 + GeckoTerminal) replaces it by default.
+    if os.environ.get('WALLET_BOT_USE_MORALIS') == '1' and not MORALIS_KEY:
+        raise SystemExit("WALLET_BOT_USE_MORALIS=1 requires MORALIS_API_KEY env var.")
+    if not ETHERSCAN_KEY:
+        log.warning("ETHERSCAN_API_KEY not set — wallet verification + scoring will be degraded.")
 
     # Keep-alive HTTP endpoint — required by Render/UptimeRobot flow.
     port = int(os.environ.get('PORT') or 0)
@@ -609,6 +1162,7 @@ def main():
 
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Core matching / hunting commands (legacy)
     app.add_handler(CommandHandler('start', start_cmd))
     app.add_handler(CommandHandler('help', start_cmd))
     app.add_handler(CommandHandler('find', find_cmd))
@@ -616,6 +1170,17 @@ def main():
     app.add_handler(CommandHandler('searchtimes', searchtimes_cmd))
     app.add_handler(CommandHandler('debug', debug_cmd))
     app.add_handler(CommandHandler('clearcache', clearcache_cmd))
+
+    # Smart-wallet discovery + quality scoring commands (new)
+    app.add_handler(CommandHandler('profile', profile_cmd))
+    app.add_handler(CommandHandler('findsmart', findsmart_cmd))
+    app.add_handler(CommandHandler('topwallets', topwallets_cmd))
+    app.add_handler(CommandHandler('earlybuyers', earlybuyers_cmd))
+    app.add_handler(CommandHandler('diamondhands', diamondhands_cmd))
+    app.add_handler(CommandHandler('prepump', prepump_cmd))
+    app.add_handler(CommandHandler('soldnear', soldnear_cmd))
+    app.add_handler(CommandHandler('copytrade', copytrade_cmd))
+    app.add_handler(CommandHandler('clones', clones_cmd))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler('hunt', hunt_start)],
