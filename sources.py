@@ -72,18 +72,57 @@ class Cache:
 
 
 class GTSource:
-    """GeckoTerminal client.  Free, no key, ~30 r/s."""
+    """GeckoTerminal client.  Free public API caps around 30 r/min in practice
+    (despite docs saying 30 r/s); we throttle to ~25 r/min to stay safely
+    under bursty 429s.  Last-known-good ETH price is kept in memory so a
+    transient 429 doesn't poison every USD-denominated calc downstream."""
 
     BASE = 'https://api.geckoterminal.com/api/v2'
 
-    def __init__(self, cache):
+    def __init__(self, cache, rate_limit_per_min=25, min_spacing_sec=1.5):
         self.cache = cache
+        self.rate = max(1, int(rate_limit_per_min))
+        self.min_spacing = float(min_spacing_sec)
+        self._lock = threading.Lock()
+        self._calls = collections.deque()  # timestamps of recent _req calls
+        self._last_call_ts = 0.0
+        # In-memory caches that survive _req failures.
+        self._last_eth_px = None  # (ts_set, price)
+
+    # ---- rate limit -------------------------------------------------------
+    def _throttle(self):
+        """Two-axis limiter: (a) at most `self.rate` calls per 60-second
+        rolling window, (b) at least `self.min_spacing` seconds between any
+        two consecutive calls.  (b) prevents bursts when ThreadPoolExecutor
+        fires N requests "simultaneously" — without it GT issues 429s even
+        when we're well under the per-minute cap."""
+        with self._lock:
+            now = time.time()
+            # axis (b): spacing floor between consecutive calls
+            since_last = now - self._last_call_ts
+            if since_last < self.min_spacing:
+                time.sleep(self.min_spacing - since_last)
+                now = time.time()
+            # axis (a): per-minute cap
+            while self._calls and (now - self._calls[0]) >= 60.0:
+                self._calls.popleft()
+            if len(self._calls) >= self.rate:
+                wait = 60.0 - (now - self._calls[0]) + 0.05
+                if wait > 0:
+                    time.sleep(wait)
+                    now = time.time()
+                    while self._calls and (now - self._calls[0]) >= 60.0:
+                        self._calls.popleft()
+            self._calls.append(time.time())
+            self._last_call_ts = time.time()
 
     # ---- http -------------------------------------------------------------
     def _req(self, path, params=None, timeout=10):
         url = self.BASE + path
         last = None
-        for attempt in range(3):
+        # Up to 5 attempts with exponential backoff: 1s, 2s, 4s, 8s, 16s.
+        for attempt in range(5):
+            self._throttle()
             try:
                 r = requests.get(url, params=(params or {}),
                                  headers={'accept': 'application/json'},
@@ -95,13 +134,13 @@ class GTSource:
                         return {}
                 if r.status_code == 429 or 500 <= r.status_code < 600:
                     last = f'http_{r.status_code}'
-                    time.sleep(0.5 * (attempt + 1))
+                    time.sleep(min(16.0, 1.0 * (2 ** attempt)))
                     continue
                 last = f'http_{r.status_code}'
                 break
             except requests.exceptions.Timeout:
                 last = 'timeout'
-                time.sleep(0.5 * (attempt + 1))
+                time.sleep(min(16.0, 1.0 * (2 ** attempt)))
             except Exception as e:
                 last = str(e)[:120]
                 time.sleep(0.3)
@@ -261,41 +300,55 @@ class GTSource:
 
     def eth_price_at(self, ts, network='eth'):
         """USD per ETH at unix `ts`.  Pulls hour-granularity OHLCV from the
-        Uniswap V2 WETH/USDC pool and bucket-locates `ts`.  Falls back to
-        3500.0 if the lookup fails."""
+        Uniswap V2 WETH/USDC pool and bucket-locates `ts`.
+
+        On lookup failure: prefers the last successful in-memory price (set
+        by any earlier successful call) over the static 3500.0 fallback.
+        That keeps PnL math approximately correct under transient 429s
+        instead of silently mispricing by ~50%."""
+        def _fallback():
+            # Prefer last good price; only hit the static constant if we've
+            # never observed a real price in this process.
+            lkg = self._last_eth_px
+            if lkg and 100 < lkg[1] < 20000:
+                return float(lkg[1])
+            return 3500.0
+
         try:
             ts = int(ts)
         except Exception:
-            return 3500.0
+            return _fallback()
         try:
             rows = self.pool_ohlcv(USDC_WETH_V2, timeframe='hour',
                                    limit=1000, network=network, ttl=3600 * 6)
         except Exception:
             rows = []
         if not rows:
-            return 3500.0
+            return _fallback()
         # binary-search for the bucket whose ts <= target
         lo, hi = 0, len(rows) - 1
         if ts <= rows[0][0]:
             close = rows[0][4]
-            return float(close) if close and 100 < close < 20000 else 3500.0
-        if ts >= rows[-1][0]:
+        elif ts >= rows[-1][0]:
             close = rows[-1][4]
-            return float(close) if close and 100 < close < 20000 else 3500.0
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if rows[mid][0] <= ts:
-                lo = mid
-            else:
-                hi = mid - 1
-        close = rows[lo][4]
+        else:
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if rows[mid][0] <= ts:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            close = rows[lo][4]
         try:
             v = float(close)
             if 100 < v < 20000:
+                # Remember most recent successful close — used as fallback
+                # for any future call that gets rate-limited.
+                self._last_eth_px = (int(time.time()), v)
                 return v
         except Exception:
             pass
-        return 3500.0
+        return _fallback()
 
 
 # ──────────────────────────────────────────────────────────────────────────────

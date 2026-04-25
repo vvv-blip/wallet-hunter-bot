@@ -960,9 +960,19 @@ async def prepump_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
         return
 
+    # pre_pump_buyers may return list[dict] OR a dict-with-reason envelope
+    # like {'reason': 'no pump detected', 'wallets': []} when the OHLCV
+    # window doesn't show the requested multiple.  Normalize before slicing.
+    reason = None
+    if isinstance(results, dict):
+        reason = results.get('reason')
+        results = results.get('wallets') or []
+
     if not results:
-        await status.edit_text(
-            f"❌ No {mult:.0f}x pump detected, or no buyers before it.")
+        msg = f"❌ No {mult:.0f}x pump detected, or no buyers before it."
+        if reason:
+            msg += f"\n_{html.escape(reason)}_"
+        await status.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
         return
 
     lines = [f"🚀 *Pre-pump buyers* — `{fmt_short(token)}` (>{mult:.0f}x)", ""]
@@ -1105,15 +1115,30 @@ async def clones_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
         return
 
-    if isinstance(results, dict) and results.get('reason'):
-        await status.edit_text(f"ℹ️ {results['reason']}")
-        return
-    if not results:
+    # clones() always returns a dict.  Two shapes:
+    #   failure: {'reason': 'foo', 'wallets': []}
+    #   success: {'funder': '0x..', 'funder_label': 'binance', 'wallets': [...]}
+    funder_info = ''
+    wallets_list = results
+    if isinstance(results, dict):
+        if results.get('reason') and not results.get('wallets'):
+            await status.edit_text(f"ℹ️ {results['reason']}")
+            return
+        wallets_list = results.get('wallets') or []
+        f_addr = results.get('funder') or ''
+        f_label = results.get('funder_label') or ''
+        if f_addr:
+            funder_info = f"\n_funder: `{fmt_short(f_addr)}`"
+            if f_label and f_label != 'unknown':
+                funder_info += f" ({f_label})"
+            funder_info += "_\n"
+
+    if not wallets_list:
         await status.edit_text("❌ No clones found.")
         return
 
-    lines = [f"🧬 *Clones of* `{wallet}`", ""]
-    for i, r in enumerate(results, 1):
+    lines = [f"🧬 *Clones of* `{wallet}`{funder_info}", ""]
+    for i, r in enumerate(wallets_list, 1):
         eth = r.get('eth_received_from_funder', 0)
         lines.append(
             f"*#{i}*  `{r['wallet']}`\n"
