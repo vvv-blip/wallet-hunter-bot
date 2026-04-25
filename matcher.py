@@ -248,6 +248,106 @@ class Matcher:
         self._cache_set(ck, rows)
         return rows
 
+    # ---- GeckoTerminal: free, no-key trader discovery -------------------
+    # GT's public API exposes per-pool trade rows that include `tx_from_address`
+    # (the actual EOA, not the router contract).  300 trades per pool, free,
+    # up to ~30 r/s.  We pull from the top N pools to widen coverage on tokens
+    # that get split across many pairs, then dedupe EOAs.  The freshness window
+    # depends on token activity — on busy memecoins, 300 trades may only reach
+    # back hours; on quiet tokens, weeks.  Best used as a complement to the
+    # Moralis token-scan, not a replacement.
+    def _gt(self, path, params=None, timeout=10):
+        url = 'https://api.geckoterminal.com/api/v2' + path
+        try:
+            r = requests.get(url, params=(params or {}),
+                             headers={'accept': 'application/json'},
+                             timeout=timeout)
+            if r.status_code == 200:
+                return r.json()
+        except Exception:
+            pass
+        return {}
+
+    def gt_token_pools(self, token, chain='eth', n_pools=15, ttl=900):
+        """Top N pools for a token, ranked by GT (volume/liquidity heuristic)."""
+        ck = f'gtpools_{chain}_{token.lower()}_n{n_pools}'
+        cached = self._cache_get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        net = 'eth' if chain == 'eth' else chain
+        # /networks/{net}/tokens/{token}/pools paginates 20/page
+        pools = []
+        page = 1
+        while len(pools) < n_pools and page <= 5:
+            j = self._gt(f'/networks/{net}/tokens/{token}/pools',
+                         params={'page': page})
+            rows = (j.get('data') or []) if isinstance(j, dict) else []
+            if not rows:
+                break
+            for row in rows:
+                addr = ((row.get('attributes') or {}).get('address') or '').lower()
+                if addr:
+                    pools.append(addr)
+                if len(pools) >= n_pools:
+                    break
+            page += 1
+        self._cache_set(ck, pools)
+        return pools
+
+    def gt_pool_trader_eoas(self, pool_addr, chain='eth', ttl=300):
+        """Up to ~300 most-recent trader EOAs on one pool (free, no key)."""
+        ck = f'gttraders_{chain}_{pool_addr.lower()}'
+        cached = self._cache_get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        net = 'eth' if chain == 'eth' else chain
+        j = self._gt(f'/networks/{net}/pools/{pool_addr}/trades')
+        rows = (j.get('data') or []) if isinstance(j, dict) else []
+        eoas = []
+        seen = set()
+        for row in rows:
+            attrs = row.get('attributes') or {}
+            eoa = (attrs.get('tx_from_address') or '').lower()
+            if eoa and eoa not in seen:
+                seen.add(eoa)
+                eoas.append(eoa)
+        self._cache_set(ck, eoas)
+        return eoas
+
+    def gt_token_traders(self, token, chain='eth', n_pools=15, max_traders=1500):
+        """Aggregate unique trader EOAs across the top N pools.  Free, ~3-6s
+        for n_pools=15.  Returns a deduped list ordered by first-seen
+        (top-pool first → newer trades first within pool)."""
+        if chain != 'eth':
+            return []
+        try:
+            pools = self.gt_token_pools(token, chain=chain, n_pools=n_pools)
+        except Exception:
+            pools = []
+        seen = set()
+        out = []
+        # Pull pools in parallel — each is one HTTP call.
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(pools)))) as ex:
+            futs = {ex.submit(self.gt_pool_trader_eoas, p, chain): p
+                    for p in pools}
+            # Order results by pool order (not completion order) so the top
+            # pool's traders come first.
+            results_by_pool = {}
+            for fut in as_completed(futs):
+                pool = futs[fut]
+                try:
+                    results_by_pool[pool] = fut.result()
+                except Exception:
+                    results_by_pool[pool] = []
+        for pool in pools:
+            for eoa in results_by_pool.get(pool, []):
+                if eoa not in seen:
+                    seen.add(eoa)
+                    out.append(eoa)
+                if len(out) >= max_traders:
+                    return out
+        return out
+
     def wallet_swaps(self, wallet, token, chain='eth', max_pages=10, ttl=300):
         """All swaps by `wallet` on `token`, normalized.  Cached 5 min."""
         ck = f'wswaps_{chain}_{wallet.lower()}_{token.lower()}_p{max_pages}'
@@ -499,8 +599,8 @@ class Matcher:
         return results[:top_n], pairs, len(stats)
 
     def find_matches(self, token, invested_eth, sold_eth, top_n=5,
-                     min_activity=True, tol=0.05, verify_top_k=50,
-                     verify_budget_seconds=75, chain='eth',
+                     min_activity=True, tol=0.05, verify_top_k=30,
+                     verify_budget_seconds=150, chain='eth',
                      since_ts=None, until_ts=None, scan_max_pages=200):
         """Return wallets within ±tol of both (invested, sold) targets.
 
@@ -609,6 +709,10 @@ class Matcher:
             'sell_ok': 0,
             'top_gainers_seeded': len(seeded_via_topgainers),
             'single_leg': 0,
+            'top_long_holders': 0,
+            'top_recent_buyers': 0,
+            'top_active': 0,
+            'gt_traders': 0,
         }
 
         # Always-verify wallets already matching ±tol on aggregate stats.
@@ -635,21 +739,116 @@ class Matcher:
                 single_leg_set.add(wallet)
         filt['single_leg'] = len(single_leg_set)
 
-        # Auto-verify all top-gainers seeded wallets — leaderboard-rank already
-        # implies they're high-PnL, finite cost (≤100 wallets).
+        # ── Top-traders-first buckets (key for hyper-active tokens where the
+        #    target wallet's full activity isn't in the scan window) ──────────
+        #
+        # Three parallel views of "high-probability" candidates.  We rank each
+        # by activity in the scan window and verify the top N of each:
+        #
+        #   • top_long_holders   — bought BEFORE scan window (eth_in=0),
+        #                          dumping now.  Sorted by n_sells DESC then
+        #                          eth_out DESC.  Captures pump-and-dump
+        #                          winners whose buy is older than scan reach.
+        #   • top_recent_buyers  — bought during scan, hasn't sold yet
+        #                          (eth_out=0).  Sorted by n_buys DESC then
+        #                          eth_in DESC.  Captures accumulators.
+        #   • top_active         — high turnover (n_buys + n_sells), regardless
+        #                          of eth_in/eth_out=0.  Captures swing traders
+        #                          and big partial-window participants.
+        #
+        # Caps sized for thoroughness on hyper-active tokens — we accept a
+        # bigger time budget so the candidate pool is deep enough that
+        # partial-window wallets (like long-holders dumping after weeks) still
+        # surface.  Combined unique pool ≤ ~700 wallets; with 10 parallel
+        # workers fits in ~150s.
+        TOP_LONG_HOLDERS_CAP  = 300
+        TOP_RECENT_BUYERS_CAP = 200
+        TOP_ACTIVE_CAP        = 300
+
+        long_holder_pool = [(w, s) for w, s in stats.items()
+                            if s['eth_in'] == 0 and s['eth_out'] > 0
+                            and s['n_sells'] > 0]
+        long_holder_pool.sort(key=lambda kv: (-kv[1]['n_sells'], -kv[1]['eth_out']))
+        top_long_holders = {w for w, _ in long_holder_pool[:TOP_LONG_HOLDERS_CAP]}
+
+        recent_buyer_pool = [(w, s) for w, s in stats.items()
+                             if s['eth_out'] == 0 and s['eth_in'] > 0
+                             and s['n_buys'] > 0]
+        recent_buyer_pool.sort(key=lambda kv: (-kv[1]['n_buys'], -kv[1]['eth_in']))
+        top_recent_buyers = {w for w, _ in recent_buyer_pool[:TOP_RECENT_BUYERS_CAP]}
+
+        active_pool = [(w, s) for w, s in stats.items()
+                       if (s['n_buys'] + s['n_sells']) > 0]
+        active_pool.sort(key=lambda kv: (-(kv[1]['n_buys'] + kv[1]['n_sells']),
+                                         -(kv[1]['eth_in'] + kv[1]['eth_out'])))
+        top_active = {w for w, _ in active_pool[:TOP_ACTIVE_CAP]}
+
+        filt['top_long_holders'] = len(top_long_holders)
+        filt['top_recent_buyers'] = len(top_recent_buyers)
+        filt['top_active'] = len(top_active)
+
+        # ── GeckoTerminal supplemental bucket (free, no key) ────────────────
+        # GT exposes `tx_from_address` on per-pool trade rows — the actual EOA
+        # (not the router).  Pulling ~300 trades from each of the top 15 pools
+        # gives ~1.5k unique recent trader EOAs in 3-6s, no API key cost.
+        # Complements Moralis: GT is freshness-biased (newest trades first per
+        # pool) so it catches whales the Moralis token-scan window may have
+        # rolled past.  These wallets are added with thin entries so they go
+        # through the same wallet-centric verify step downstream.
+        GT_BUCKET_CAP = 300
+        gt_added = set()
+        if chain == 'eth':
+            try:
+                gt_eoas = self.gt_token_traders(token, chain=chain, n_pools=15,
+                                                max_traders=GT_BUCKET_CAP)
+            except Exception:
+                gt_eoas = []
+            for eoa in gt_eoas[:GT_BUCKET_CAP]:
+                gt_added.add(eoa)
+                if eoa not in stats:
+                    # Thin entry — verify step computes exact totals.
+                    stats[eoa] = {
+                        'eth_in': 0.0, 'eth_out': 0.0,
+                        'n_buys': 0, 'n_sells': 0,
+                        'first_block': 0, 'last_block': 0,
+                        'last_buy_ts': 0, 'last_sell_ts': 0,
+                        'buy_ts': [], 'sell_ts': [],
+                    }
+        filt['gt_traders'] = len(gt_added)
+
+        # Build verify_set in priority order, deduped.  Order matters because
+        # we cut at the budget deadline — earlier slots are guaranteed to run.
         verify_set = list(must_verify)
-        for w in seeded_via_topgainers:
-            if w not in must_verify and w not in verify_set:
+        seen = set(must_verify)
+
+        def _add_bucket(bucket, label):
+            added = 0
+            for w in bucket:
+                if w in seen:
+                    continue
+                seen.add(w)
                 verify_set.append(w)
-        for w in single_leg_set:
-            if w not in must_verify and w not in verify_set:
-                verify_set.append(w)
+                added += 1
+            return added
+
+        _add_bucket(seeded_via_topgainers, 'top_gainers')   # ≤100
+        _add_bucket(top_long_holders,      'long_holders')  # ≤300
+        _add_bucket(top_recent_buyers,     'recent_buyers') # ≤200
+        _add_bucket(top_active,            'active')        # ≤300
+        _add_bucket(gt_added,              'gt_traders')    # ≤300
+        _add_bucket(single_leg_set,        'single_leg')
+
+        # Fill remaining slots from regular prefilter ranking up to verify_top_k
+        # extra (i.e., normal prefilter top adds on top of priority buckets).
+        added_from_rank = 0
         for _, wallet, _ in prefilter:
-            if wallet in must_verify or wallet in seeded_via_topgainers or wallet in single_leg_set:
+            if wallet in seen:
                 continue
-            if len(verify_set) >= verify_top_k:
+            if added_from_rank >= verify_top_k:
                 break
+            seen.add(wallet)
             verify_set.append(wallet)
+            added_from_rank += 1
 
         results = []
         deadline = time.time() + verify_budget_seconds
@@ -662,7 +861,7 @@ class Matcher:
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=5) as ex:
+        with ThreadPoolExecutor(max_workers=8) as ex:
             futs = {ex.submit(_verify, w): w for w in verify_set}
             for fut in as_completed(futs):
                 if time.time() > deadline:
