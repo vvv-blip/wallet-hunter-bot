@@ -908,3 +908,96 @@ class Discovery:
 
         scored.sort(key=lambda x: x['composite'])
         return scored[:top_n]
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 9) insider_buyers
+    # ──────────────────────────────────────────────────────────────────────
+    def insider_buyers(self, token, scorer, max_age_days=60, min_score=65,
+                       early_pool_size=100, top_n=15, network='eth'):
+        """Fresh wallets (age <= max_age_days) that bought the token early
+        AND have high overall quality scores.  Highest-signal alpha pattern:
+        a fresh wallet buying chronologically-first frequently indicates
+        insider knowledge or pre-launch tipoff.  Combines `early_buyers`
+        (chronological priority) with `scorer.score()` (quality filter).
+
+        Inputs:  token, scorer, max_age_days, min_score, early_pool_size, top_n
+        Outputs: list[{wallet, first_buy_ts, age_days, quality_score,
+                       quality_rating, quality_flags, tokens_received,
+                       composite (lower=better)}]
+        Time budget: ~30-60s.  Cache 30 min per token+threshold combo.
+        """
+        ck = (f'disc_insider_{network}_{token.lower()}'
+              f'_age{max_age_days}_score{min_score}_n{top_n}')
+        cached = self.cache.get(ck, ttl=1800)
+        if cached is not None:
+            return cached
+
+        # Need both an Etherscan source (for tokentx genesis walk and
+        # wallet-age) and a scorer.  Without etherscan early_buyers returns [].
+        if not self.es:
+            return {'reason': 'requires ETHERSCAN_API_KEY for genesis walk',
+                    'wallets': []}
+        if scorer is None:
+            return {'reason': 'requires WalletQualityScorer', 'wallets': []}
+
+        try:
+            early = self.early_buyers(token, limit=early_pool_size,
+                                      network=network)
+        except Exception:
+            early = []
+        if not early:
+            return {'reason': 'no early buyers found (token may be too new '
+                              'or transfers not indexed yet)', 'wallets': []}
+
+        # Score the early-buyer pool.  Etherscan is the bottleneck so cap
+        # parallelism at 4.
+        def _score(entry):
+            try:
+                q = scorer.score(entry['wallet'])
+            except Exception:
+                q = None
+            return entry, q
+
+        scored = []
+        with ThreadPoolExecutor(max_workers=4) as ex:
+            futs = [ex.submit(_score, e) for e in early]
+            for fut in as_completed(futs):
+                try:
+                    e, q = fut.result()
+                except Exception:
+                    continue
+                if not isinstance(q, dict):
+                    continue
+                overall = self._safe_float(q.get('overall'), 0.0)
+                meta = q.get('meta') or {}
+                age_days = self._safe_float(meta.get('age_days'), 999.0)
+
+                # Filter: must be fresh AND high quality
+                if age_days > max_age_days:
+                    continue
+                if overall < min_score:
+                    continue
+
+                # Composite: prefer younger wallets with higher scores.
+                # age_days/10 gives 0..6 penalty for 0..60 days; we then
+                # subtract from a high baseline so lower=better is consistent
+                # with other discovery rankers.
+                composite = (100.0 - overall) + (age_days / 10.0)
+
+                scored.append({
+                    'wallet': e['wallet'],
+                    'first_buy_ts': e.get('first_buy_ts', 0),
+                    'tokens_received': e.get('tokens_received', 0.0),
+                    'eth_at_first_buy': e.get('eth_at_first_buy'),
+                    'age_days': age_days,
+                    'quality_score': overall,
+                    'quality_rating': q.get('rating') or 'unknown',
+                    'quality_flags': q.get('flags') or [],
+                    'composite': composite,
+                })
+
+        scored.sort(key=lambda x: x['composite'])
+        scored = scored[:top_n]
+        if scored:
+            self.cache.set(ck, scored)
+        return scored

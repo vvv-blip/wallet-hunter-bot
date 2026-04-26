@@ -118,6 +118,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/earlybuyers 0xTOKEN` — first wallets to ever buy this token\n"
         "`/diamondhands 0xTOKEN` — bought and held 14+ days\n"
         "`/prepump 0xTOKEN` — wallets that bought *before* the first 5x pump\n"
+        "`/insider 0xTOKEN` — fresh + high-quality early buyers (alpha hunter)\n"
         "`/soldnear 0xTOKEN` — wallets that sold within 80% of the all-time peak\n\n"
         "*Profile / follow a wallet:*\n"
         "`/profile 0xWALLET` — quality score + signals (age, funding, bot/rug flags)\n"
@@ -929,6 +930,80 @@ async def diamondhands_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                            disable_web_page_preview=True)
 
 
+async def insider_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fresh + high-quality wallets that bought a token early — alpha hunter."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/insider <contract> [max_age_days=60] [min_score=65]`\n"
+            "Fresh, high-quality wallets that bought early — alpha-hunter signal.\n"
+            "Combines `/earlybuyers` + quality scoring to surface insider plants.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    token = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', token):
+        await update.message.reply_text("First arg must be a 0x… contract address.")
+        return
+    max_age = 60
+    min_score = 65
+    if len(args) >= 2:
+        try: max_age = int(args[1])
+        except: pass
+    if len(args) >= 3:
+        try: min_score = int(args[2])
+        except: pass
+    if not _es:
+        await update.message.reply_text(
+            "❌ Needs ETHERSCAN_API_KEY for genesis transfer walk + scoring.")
+        return
+
+    status = await update.message.reply_text(
+        f"🕵️ Hunting insiders on {fmt_short(token)} "
+        f"(age≤{max_age}d, score≥{min_score})…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _disc.insider_buyers(
+                token, _scorer, max_age_days=max_age,
+                min_score=min_score, top_n=15))
+    except Exception as e:
+        log.exception("insider error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if isinstance(results, dict):
+        await status.edit_text(
+            f"ℹ️ {results.get('reason', 'no insider buyers found')}")
+        return
+    if not results:
+        await status.edit_text(
+            f"❌ No fresh, high-score buyers found for {fmt_short(token)}.")
+        return
+
+    lines = [
+        f"🕵️ *Insider buyers* — `{fmt_short(token)}`",
+        f"_filters: age ≤ {max_age}d, score ≥ {min_score}_",
+        "",
+    ]
+    for i, r in enumerate(results, 1):
+        flags_str = ', '.join(r.get('quality_flags', [])[:3]) or '—'
+        eth_at = r.get('eth_at_first_buy')
+        eth_str = f"{eth_at:.3f} ETH" if eth_at else "—"
+        lines.append(
+            f"*#{i}* `{r['wallet']}`\n"
+            f"   age: {r['age_days']:.0f}d · "
+            f"score: {r['quality_score']:.0f} ({r['quality_rating']})\n"
+            f"   first buy: {fmt_ts(r.get('first_buy_ts', 0))} · "
+            f"eth: {eth_str}\n"
+            f"   flags: {flags_str}"
+        )
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
 async def prepump_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Wallets that bought before the first big pump."""
     args = ctx.args
@@ -1203,6 +1278,7 @@ def main():
     app.add_handler(CommandHandler('earlybuyers', earlybuyers_cmd))
     app.add_handler(CommandHandler('diamondhands', diamondhands_cmd))
     app.add_handler(CommandHandler('prepump', prepump_cmd))
+    app.add_handler(CommandHandler('insider', insider_cmd))
     app.add_handler(CommandHandler('soldnear', soldnear_cmd))
     app.add_handler(CommandHandler('copytrade', copytrade_cmd))
     app.add_handler(CommandHandler('clones', clones_cmd))
