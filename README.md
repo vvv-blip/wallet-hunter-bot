@@ -1,76 +1,141 @@
 # Wallet Hunter Bot
 
-Telegram bot that answers: *"Who bought this token for ~X and sold for ~Y?"*
+Telegram bot for on-chain wallet discovery on Ethereum mainnet. Originally answered the single question *"Who bought this token for ~X and sold for ~Y?"* — now a full toolkit for finding and evaluating smart-money wallets.
 
-Given a token contract + your target invested/sold amounts, it scans every swap on the token's Uniswap WETH pair(s) and returns the 5 wallets whose aggregated trade footprint is closest to yours.
+Powered by **GeckoTerminal** (free, no key) + **Etherscan v2** (free key, 100k req/day) — no paid APIs required.
 
-## 1. Create the Telegram bot
+---
 
-1. Open Telegram → `@BotFather`
-2. Send `/newbot`, pick a name, pick a username ending in `bot`
-3. Copy the token it gives you (looks like `7981234567:ABC…`)
+## Quick start
 
-## 2. Install
+1. **Create the bot:** Telegram → `@BotFather` → `/newbot` → copy the token
+2. **Get an Etherscan v2 key:** https://etherscan.io/myapikey (free, 5 req/s)
+3. **Install:**
+   ```bash
+   cd /tmp/wallet_research/bot
+   python3 -m venv venv
+   source venv/bin/activate
+   pip install -r requirements.txt
+   ```
+4. **Configure:**
+   ```bash
+   export TELEGRAM_BOT_TOKEN="paste-from-botfather"
+   export ETHERSCAN_API_KEY="paste-from-etherscan"
+   # MORALIS_API_KEY is no longer required — only used if you opt in via:
+   # export WALLET_BOT_USE_MORALIS=1
+   ```
+5. **Run:** `python bot.py` → open the bot in Telegram → `/start`
 
-```bash
-cd /tmp/wallet_research/bot
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-## 3. Configure
-
-```bash
-export TELEGRAM_BOT_TOKEN="paste-from-botfather"
-export ETHERSCAN_API_KEY="AF7HK38VHNI22S69QYABSVTA6SFPZN7E5Z"   # or your own
-```
-
-## 4. Run
-
-```bash
-python bot.py
-```
-
-You'll see `Bot starting...`. Open Telegram, find your bot by its username, hit **Start**.
+---
 
 ## Commands
 
-| Command | Example | Notes |
-|--------|--------|-------|
-| `/start` or `/help` | — | Usage help |
-| `/find <contract> <invested> <sold>` | `/find 0xf280b16ef293d8e534e370794ef26bf312694126 0.5 2.3` | One-shot query |
-| `/hunt` | — | Step-by-step: asks contract → invested → sold |
-| `/clearcache` | — | Flush cached Etherscan/DexScreener data |
-| `/cancel` | — | Exit a `/hunt` flow |
+### Discover hot tokens
+| Command | Example | What it does |
+|---|---|---|
+| `/trending [N]` | `/trending 12` | Top trending Ethereum tokens — 24h+6h+1h price change, volume, FDV, liquidity, buyer/seller balance |
 
-Amount formats: `0.5`, `0.5 eth`, `$500`, `500usd`. Raw numbers ≥ 50 are treated as USD (it's too large for ETH); smaller as ETH.
+### Discover top traders on a token
+| Command | Example | What it does |
+|---|---|---|
+| `/topwallets <ca>` | `/topwallets 0x6982508145454ce325ddbe47a25d4ec3d2311933` | Leaderboard by total PnL (realized + unrealized mark-to-market) |
+| `/earlybuyers <ca>` | `/earlybuyers 0x...` | First wallets to ever buy this token |
+| `/diamondhands <ca>` | `/diamondhands 0x...` | Wallets that bought and held 14+ days |
+| `/prepump <ca> [Nx]` | `/prepump 0x... 5` | Wallets that bought before the first 5× pump in 24h |
+| `/insider <ca> [age=60] [score=65]` | `/insider 0x...` | Fresh + high-quality early buyers — *the alpha-hunter* |
+| `/soldnear <ca>` | `/soldnear 0x...` | Wallets that sold within 80% of all-time peak price |
 
-## How it works
+### Profile / follow a wallet
+| Command | Example | What it does |
+|---|---|---|
+| `/scout <wallet>` | `/scout 0x5b43...` | One-page research: profile + recent buys + clones |
+| `/profile <wallet>` | `/profile 0x...` | Quality score (0–100) + flags (age, funding, bot/rug signals) |
+| `/copytrade <wallet>` | `/copytrade 0x...` | What is this wallet currently buying? |
+| `/clones <wallet>` | `/clones 0x...` | Wallets sharing the same funding source (sybil cluster) |
 
-1. **DexScreener** → list the token's Uniswap V2/V3 pairs that quote against WETH (sorted by liquidity, top 3).
-2. **Etherscan v2 `tokentx`** filtered to `(token, pair)` → every token transfer in/out of the pair = every buy/sell.
-3. **Etherscan v2 `tokentx`** filtered to `(WETH, pair)` → every WETH flow in/out of the same pair.
-4. **Join by transaction hash**:
-   - token leaves pair + WETH enters pair → **BUY** by `to` address, ETH spent = WETH in
-   - token enters pair + WETH leaves pair → **SELL** by `from` address, ETH received = WETH out
-5. Drop router/aggregator addresses (Uniswap/1inch/0x/CoW/ParaSwap/LI.FI/Maestro/Metamask Swap).
-6. Rank by relative distance: `|invested − target| / target + |sold − target| / target`.
+### Match a PnL card to a wallet
+| Command | Example | What it does |
+|---|---|---|
+| `/find <ca> <inv> <sold>` | `/find 0x... 0.5 2.3` | Top 5 wallets whose ETH-in/out matches |
+| `/findsmart <ca> <inv> <sold>` | `/findsmart 0x... 0.5 2.3` | `/find` overlaid with quality scoring |
+| `/findwallet <ca> <wallet> <inv> <sold>` | — | Verify a specific wallet against a target |
+| `/searchtimes <ca> <minBuy> <maxBuy> <minSell> <maxSell>` | — | Find wallets matching time windows (use `_` for open) |
+| `/hunt` | — | Step-by-step interactive flow (asks contract → invested → sold) |
+| `/debug <ca> <wallet>` | — | Show every trade for a wallet on a token |
 
-Each reply gives the top 5 matches with bought / sold / PnL / ROI and links to Etherscan, Debank, GMGN for that wallet.
+Amount formats: `0.5`, `0.5 eth`, `$500`, `500usd`. Raw numbers ≥ 50 are treated as USD; smaller as ETH.
+
+---
+
+## Quality scoring (0–100)
+
+Each wallet score is the weighted composite of 6 orthogonal signals computed entirely from on-chain behavior:
+
+| Signal | Weight | What it measures |
+|---|---|---|
+| **bot_avoid** | 25% | Tx velocity, gas-price entropy, MEV-builder usage |
+| **funding** | 20% | First deposit source — CEX hot wallet (good) vs Tornado mixer (bad) |
+| **diversity** | 15% | Distinct ERC-20s touched in 90d (more = real human) |
+| **rug_avoid** | 15% | Contract-deployment count (many = farmer/rugger) |
+| **activity** | 15% | Average per-token holding time (sub-hour = bot, 30d+ = HODLer) |
+| **age** | 10% | Days since first transaction |
+
+Ratings: **avoid** (<30) → **risky** (<50) → **normal** (<65) → **good** (<80) → **great** (<90) → **elite** (90+)
+
+---
+
+## Architecture
+
+```
+┌──────────┐
+│ bot.py   │  Telegram handlers, render formatters
+└────┬─────┘
+     │
+     ├──► matcher.py       PnL-card amount matching (legacy /find, /hunt)
+     ├──► discovery.py     10 wallet-finding patterns + /scout meta-cmd
+     ├──► quality.py       6-signal wallet quality scorer
+     │
+     └──► sources.py       Free-API data layer
+          ├── GTSource       GeckoTerminal: pools, trades, OHLCV, trending
+          │                  Two-axis throttle (25/min + 1.5s spacing)
+          └── EtherscanSource Etherscan v2: tokentx, txlist, internal,
+                              wallet age/funding/diversity/deployers
+                              5/sec leaky-bucket rate limit
+```
+
+Key design choices:
+- **GT only returns ~300 recent trades per pool**, so historical patterns (early buyers, full lifecycle) walk Etherscan `tokentx` instead.
+- **No Moralis dependency** in the default boot path. Set `WALLET_BOT_USE_MORALIS=1` to opt back in to the legacy paid path.
+- **All caches skip empty/error responses** to avoid poisoning lookups for the full TTL.
+- **`wallet_age_days` caches the immutable `first_ts`** and computes age dynamically — so cached scores don't drift over time.
+
+---
 
 ## Caveats
 
-- Matches only swaps against the **pair directly**. If a wallet routed through multiple hops that did not touch this pair, it's invisible. (Fine for 99% of memecoin trades.)
-- Bot-routed trades (Maestro, Banana, Sigma, Unibot) show the **end wallet** as the buyer because the bot forwards the token, so this still works as long as the bot address itself is in the router list.
-- Results are aggregated per wallet across **all time** within the last ~50k events per pair. If your target did many small trades, the summed total is what matches.
-- USD amounts are converted to ETH using live WETH price from DexScreener — not historical per-trade. For precision, give amounts in ETH.
-- Data is cached for 30 min per (contract, pair). Use `/clearcache` after a very fresh trade.
+- Match commands (`/find` etc.) only see swaps against the pair directly. Multi-hop routes that don't touch the pair are invisible (~1% of memecoin trades).
+- `/topwallets` ranks on realized + unrealized PnL using a median price-per-token from the GT trade sample. Wallets we observe selling but never buying (cost basis outside the GT window) are dropped to prevent fake +∞ ROIs.
+- `/insider` requires Etherscan key for the genesis-walk + scoring. Other commands degrade gracefully if the key is missing.
+- Quality scoring is cached 6h per wallet. Run `/clearcache` to force re-fetch.
 
-## Run 24/7 (optional)
+---
+
+## Deploy
+
+The bot is designed to run as a Telegram polling worker with a tiny HTTP keep-alive endpoint. Render and Fly are both supported via the included `render.yaml` and `fly.toml`. See `DEPLOY_RENDER.md` for the step-by-step Render deploy.
+
+Required env on the host:
+- `TELEGRAM_BOT_TOKEN`
+- `ETHERSCAN_API_KEY`
+- (optional) `PORT` — set by Render automatically; bot serves a `200 ok` on `GET /` for UptimeRobot
+- (optional) `WALLET_BOT_USE_MORALIS=1` — opts back into the legacy Moralis path
+
+---
+
+## Run 24/7 (self-host)
 
 ```bash
-# with systemd (Linux)
+# systemd (Linux)
 sudo tee /etc/systemd/system/wallet-bot.service <<'EOF'
 [Unit]
 Description=Wallet Hunter Bot
@@ -80,8 +145,8 @@ After=network-online.target
 User=%i
 Environment=TELEGRAM_BOT_TOKEN=...
 Environment=ETHERSCAN_API_KEY=...
-WorkingDirectory=/tmp/wallet_research/bot
-ExecStart=/tmp/wallet_research/bot/venv/bin/python bot.py
+WorkingDirectory=/opt/wallet-hunter-bot
+ExecStart=/opt/wallet-hunter-bot/venv/bin/python bot.py
 Restart=on-failure
 
 [Install]
@@ -90,4 +155,4 @@ EOF
 sudo systemctl enable --now wallet-bot
 ```
 
-On macOS, use `launchd` or just `nohup python bot.py &`.
+On macOS, use `launchd` or simply `nohup python bot.py &`.
