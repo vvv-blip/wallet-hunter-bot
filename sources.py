@@ -467,8 +467,25 @@ class EtherscanSource:
 
     def _paginate(self, params, max_pages=20, page_size=10000, chain_id=1):
         """Walks `page=1..max_pages` with `offset=page_size`.
-        Stops when result is empty or shorter than page_size."""
+        Stops when result is empty or shorter than page_size.
+
+        Backwards-compat: returns just the list.  Internally uses
+        `_paginate_status` so callers that need to know whether the empty
+        list came from a real "no rows" response vs. an API error can
+        switch to that one."""
+        rows, _ok = self._paginate_status(params, max_pages=max_pages,
+                                          page_size=page_size,
+                                          chain_id=chain_id)
+        return rows
+
+    def _paginate_status(self, params, max_pages=20, page_size=10000,
+                         chain_id=1):
+        """Like `_paginate` but returns (rows, ok).  ok=True means at least
+        one page was fetched successfully (the empty list is real); ok=False
+        means the very first request errored and the empty list is unreliable
+        — callers should NOT cache in that case."""
         out = []
+        ok = False
         for page in range(1, max_pages + 1):
             p = dict(params)
             p['page'] = page
@@ -479,23 +496,28 @@ class EtherscanSource:
             res = j.get('result')
             if not isinstance(res, list):
                 break
+            ok = True
             out.extend(res)
             if len(res) < page_size:
                 break
-        return out
+        return out, ok
 
     # ---- raw fetchers (cached) -------------------------------------------
+    # These all use _paginate_status so we can skip caching when the API
+    # call failed.  Caching an empty list from a failed call would freeze
+    # callers' downstream conclusions for the whole TTL.
     def tokentx_for_address_token(self, wallet, token, max_pages=10):
         ck = f'es_tt_at_{wallet.lower()}_{token.lower()}_p{max_pages}'
         cached = self.cache.get(ck, ttl=300)
         if cached is not None:
             return cached
-        rows = self._paginate({
+        rows, ok = self._paginate_status({
             'module': 'account', 'action': 'tokentx',
             'address': wallet, 'contractaddress': token,
             'sort': 'desc',
         }, max_pages=max_pages)
-        self.cache.set(ck, rows)
+        if ok:
+            self.cache.set(ck, rows)
         return rows
 
     def tokentx_for_token(self, token, max_pages=20, since_block=0):
@@ -503,13 +525,14 @@ class EtherscanSource:
         cached = self.cache.get(ck, ttl=300)
         if cached is not None:
             return cached
-        rows = self._paginate({
+        rows, ok = self._paginate_status({
             'module': 'account', 'action': 'tokentx',
             'contractaddress': token,
             'startblock': since_block,
             'sort': 'desc',
         }, max_pages=max_pages)
-        self.cache.set(ck, rows)
+        if ok:
+            self.cache.set(ck, rows)
         return rows
 
     def tokentx_for_wallet(self, wallet, max_pages=10):
@@ -517,12 +540,13 @@ class EtherscanSource:
         cached = self.cache.get(ck, ttl=300)
         if cached is not None:
             return cached
-        rows = self._paginate({
+        rows, ok = self._paginate_status({
             'module': 'account', 'action': 'tokentx',
             'address': wallet,
             'sort': 'desc',
         }, max_pages=max_pages)
-        self.cache.set(ck, rows)
+        if ok:
+            self.cache.set(ck, rows)
         return rows
 
     def txlist(self, wallet, max_pages=2, sort='asc'):
@@ -530,11 +554,12 @@ class EtherscanSource:
         cached = self.cache.get(ck, ttl=3600)
         if cached is not None:
             return cached
-        rows = self._paginate({
+        rows, ok = self._paginate_status({
             'module': 'account', 'action': 'txlist',
             'address': wallet, 'sort': sort,
         }, max_pages=max_pages)
-        self.cache.set(ck, rows)
+        if ok:
+            self.cache.set(ck, rows)
         return rows
 
     def txlistinternal(self, wallet, max_pages=5):
@@ -542,11 +567,12 @@ class EtherscanSource:
         cached = self.cache.get(ck, ttl=1800)
         if cached is not None:
             return cached
-        rows = self._paginate({
+        rows, ok = self._paginate_status({
             'module': 'account', 'action': 'txlistinternal',
             'address': wallet, 'sort': 'desc',
         }, max_pages=max_pages)
-        self.cache.set(ck, rows)
+        if ok:
+            self.cache.set(ck, rows)
         return rows
 
     def is_contract(self, addr):
@@ -684,29 +710,37 @@ class EtherscanSource:
 
     # ---- wallet age, diversity, funding, deployed contracts --------------
     def wallet_age_days(self, wallet):
-        """Days since wallet's first outbound tx (txlist asc page 1)."""
+        """Days since wallet's first outbound tx (txlist asc page 1).
+
+        Caches the immutable `first_ts` timestamp, NOT the relative `days`
+        value — otherwise a wallet cached as N days old stays N forever
+        even as time passes.  Days is computed from first_ts on every
+        call so it always reflects current time.
+
+        Empty/transient-failure results are NOT cached: caching 0 for 7
+        days would permanently mark a wallet as un-scorable on a single
+        flaky API call.
+        """
         wlow = wallet.lower()
-        ck = f'es_age_{wlow}'
-        cached = self.cache.get(ck, ttl=86400 * 7)
-        if cached is not None:
-            return cached
+        ck = f'es_first_ts_{wlow}'  # cache key bumped — old `es_age_*` had stale-days bug
+        cached_first_ts = self.cache.get(ck, ttl=86400 * 7)
+        if cached_first_ts is not None and cached_first_ts > 0:
+            return (time.time() - float(cached_first_ts)) / 86400.0
+
         j = self._get({'module': 'account', 'action': 'txlist',
                        'address': wallet, 'sort': 'asc',
                        'page': 1, 'offset': 1})
         rows = j.get('result') if isinstance(j, dict) else []
         if not isinstance(rows, list) or not rows:
-            self.cache.set(ck, 0.0)
-            return 0.0
+            return 0.0  # do NOT cache — let next call retry
         try:
             first_ts = int(rows[0].get('timeStamp') or 0)
         except Exception:
             first_ts = 0
         if first_ts <= 0:
-            self.cache.set(ck, 0.0)
-            return 0.0
-        days = (time.time() - first_ts) / 86400.0
-        self.cache.set(ck, days)
-        return days
+            return 0.0  # do NOT cache failure
+        self.cache.set(ck, first_ts)
+        return (time.time() - first_ts) / 86400.0
 
     def wallet_distinct_tokens(self, wallet, since_ts=None):
         """Number of distinct ERC-20s the wallet has touched, optionally since
@@ -789,10 +823,12 @@ class EtherscanSource:
                 chosen_ts = token_first_ts
 
         if not chosen:
-            res = ('', 'unknown')
-        else:
-            label = CEX_LABELS.get(chosen, 'unknown')
-            res = (chosen, label)
+            # Don't cache "no funder found" — this might be a transient
+            # API failure rather than a real bridged-in wallet.  Caching
+            # would permanently mark this wallet as un-scorable for funding.
+            return ('', 'unknown')
+        label = CEX_LABELS.get(chosen, 'unknown')
+        res = (chosen, label)
         self.cache.set(ck, list(res))
         return res
 
