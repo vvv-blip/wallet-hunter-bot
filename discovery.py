@@ -1043,3 +1043,89 @@ class Discovery:
         if scored:
             self.cache.set(ck, scored)
         return scored
+
+    # ──────────────────────────────────────────────────────────────────────
+    # 10) scout_wallet — one-shot wallet research summary
+    # ──────────────────────────────────────────────────────────────────────
+    def scout_wallet(self, wallet, scorer, copytrade_days=7,
+                     copytrade_top=8, clones_top=5):
+        """One-page consolidated wallet research.  Returns the union of
+        /profile + /copytrade + /clones in a single response so users
+        don't have to run three commands to evaluate a wallet.
+
+        Inputs:  wallet, scorer (WalletQualityScorer)
+        Outputs: {wallet, profile, recent_buys, clones, profile_error,
+                  copytrade_error, clones_error}
+        Time budget: ~30-45s.  Cache 30 min per wallet.
+        """
+        wlow = wallet.lower()
+        ck = f'disc_scout_{wlow}_d{copytrade_days}'
+        cached = self.cache.get(ck, ttl=1800)
+        if cached is not None:
+            return cached
+
+        result = {
+            'wallet': wlow,
+            'profile': None,
+            'recent_buys': [],
+            'clones': None,
+            'profile_error': None,
+            'copytrade_error': None,
+            'clones_error': None,
+        }
+
+        # Three sub-tasks parallelized — they share Etherscan rate limit
+        # but the leaky bucket inside EtherscanSource sequences them
+        # safely.  Each is wrapped in try/except so a partial failure
+        # still returns whatever else succeeded.
+        def _profile():
+            try:
+                if scorer is None:
+                    return ('error', 'no scorer')
+                return ('ok', scorer.score(wallet))
+            except Exception as e:
+                return ('error', f'{type(e).__name__}: {str(e)[:80]}')
+
+        def _copy():
+            try:
+                return ('ok', self.copytrade(wallet, days=copytrade_days,
+                                             top_n=copytrade_top))
+            except Exception as e:
+                return ('error', f'{type(e).__name__}: {str(e)[:80]}')
+
+        def _cln():
+            try:
+                if not self.es:
+                    return ('error', 'no etherscan')
+                return ('ok', self.clones(wallet, top_n=clones_top))
+            except Exception as e:
+                return ('error', f'{type(e).__name__}: {str(e)[:80]}')
+
+        with ThreadPoolExecutor(max_workers=3) as ex:
+            f_prof = ex.submit(_profile)
+            f_copy = ex.submit(_copy)
+            f_cln = ex.submit(_cln)
+            for which, fut in [('profile', f_prof), ('copy', f_copy),
+                               ('cln', f_cln)]:
+                try:
+                    status, val = fut.result(timeout=60)
+                except Exception as e:
+                    status, val = 'error', str(e)[:80]
+                if which == 'profile':
+                    if status == 'ok':
+                        result['profile'] = val
+                    else:
+                        result['profile_error'] = val
+                elif which == 'copy':
+                    if status == 'ok':
+                        result['recent_buys'] = val or []
+                    else:
+                        result['copytrade_error'] = val
+                else:  # cln
+                    if status == 'ok':
+                        result['clones'] = val
+                    else:
+                        result['clones_error'] = val
+
+        self.cache.set(ck, result)
+        return result

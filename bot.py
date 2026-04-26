@@ -121,6 +121,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/insider 0xTOKEN` — fresh + high-quality early buyers (alpha hunter)\n"
         "`/soldnear 0xTOKEN` — wallets that sold within 80% of the all-time peak\n\n"
         "*Profile / follow a wallet:*\n"
+        "`/scout 0xWALLET` — *one-page research* (profile + buys + clones)\n"
         "`/profile 0xWALLET` — quality score + signals (age, funding, bot/rug flags)\n"
         "`/copytrade 0xWALLET` — what is this wallet currently buying?\n"
         "`/clones 0xWALLET` — wallets sharing the same funding source (sybil check)\n\n"
@@ -1172,6 +1173,89 @@ async def copytrade_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                            disable_web_page_preview=True)
 
 
+async def scout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """One-page wallet research: profile + recent buys + clones."""
+    args = ctx.args
+    if len(args) < 1:
+        await update.message.reply_text(
+            "Usage: `/scout <wallet>`\n"
+            "One-page wallet research — quality score, recent buys, clones.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    wallet = args[0].lower()
+    if not re.match(r'^0x[0-9a-f]{40}$', wallet):
+        await update.message.reply_text("First arg must be a 0x… wallet.")
+        return
+
+    status = await update.message.reply_text(
+        f"🔬 Scouting {fmt_short(wallet)}…  (this takes ~30s)"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        report = await loop.run_in_executor(
+            None, lambda: _disc.scout_wallet(wallet, _scorer))
+    except Exception as e:
+        log.exception("scout error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    lines = [f"🔬 *Wallet scout* — `{wallet}`", ""]
+
+    # ── Profile (quality score)
+    prof = report.get('profile')
+    if prof:
+        lines.append(_fmt_quality_block(prof))
+    elif report.get('profile_error'):
+        lines.append(f"_profile: {report['profile_error']}_")
+
+    # ── Recent buys (copytrade)
+    buys = report.get('recent_buys') or []
+    if buys:
+        lines.append("\n*Recent buys (copytrade):*")
+        for r in buys[:6]:
+            sym = (r.get('symbol') or '').upper() or 'TOKEN'
+            net = r.get('net_received', 0)
+            ca = r.get('contract', '')
+            lines.append(
+                f"  • `{ca}` ({sym})\n"
+                f"    net: {net:,.0f} · last buy: "
+                f"{fmt_ts(r.get('last_buy_ts', 0))}"
+            )
+    elif report.get('copytrade_error'):
+        lines.append(f"\n_copytrade: {report['copytrade_error']}_")
+    else:
+        lines.append("\n_no recent buys observed_")
+
+    # ── Clones (sybil cluster)
+    clones = report.get('clones') or {}
+    cw = clones.get('wallets') if isinstance(clones, dict) else None
+    creason = clones.get('reason') if isinstance(clones, dict) else None
+    if cw:
+        funder_addr = clones.get('funder', '')
+        funder_label = clones.get('funder_label', '')
+        head = "\n*Clones (shared funder):*"
+        if funder_addr:
+            head += f"  _via `{fmt_short(funder_addr)}`"
+            if funder_label and funder_label != 'unknown':
+                head += f" ({funder_label})"
+            head += "_"
+        lines.append(head)
+        for c in cw[:5]:
+            lines.append(
+                f"  • `{c['wallet']}` "
+                f"(funded {fmt_ts(c.get('first_funded_ts', 0))})"
+            )
+    elif creason:
+        lines.append(f"\n_clones: {creason}_")
+    elif report.get('clones_error'):
+        lines.append(f"\n_clones: {report['clones_error']}_")
+
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
 async def clones_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Wallets sharing a funding source — sybil/cluster detection."""
     args = ctx.args
@@ -1295,6 +1379,7 @@ def main():
     app.add_handler(CommandHandler('soldnear', soldnear_cmd))
     app.add_handler(CommandHandler('copytrade', copytrade_cmd))
     app.add_handler(CommandHandler('clones', clones_cmd))
+    app.add_handler(CommandHandler('scout', scout_cmd))
 
     conv = ConversationHandler(
         entry_points=[CommandHandler('hunt', hunt_start)],
