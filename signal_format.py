@@ -50,9 +50,16 @@ def format_card(signal, eth_price_usd=None):
     n1 = signal.get('n_buys_1m') or 0
     ub = signal.get('unique_buyers_5m') or 0
     vr = signal.get('velocity_ratio') or 0.0
-    lines.append(
-        f"📊 1m: {v1:.2f} ETH  ·  5m: {v5:.2f} ETH  ·  ⚡ {vr:.1f}× velocity"
-    )
+    turn = signal.get('liq_turnover_1m') or 0.0
+    # Liquidity turnover — % of pool turning over in 1m.  Headline metric
+    # for tiny-pool firehoses where vol_1m absolute is small but means a lot.
+    turn_pct = turn * 100.0
+    parts2 = [f"📊 1m: {v1:.2f} ETH"]
+    parts2.append(f"5m: {v5:.2f} ETH")
+    parts2.append(f"⚡ {vr:.1f}× velocity")
+    if turn_pct >= 5.0:
+        parts2.append(f"🌊 {turn_pct:.0f}% liq turnover")
+    lines.append("  ·  ".join(parts2))
     lines.append(
         f"👥 {n5} buys / {signal.get('n_sells_5m', 0)} sells in 5m  ·  "
         f"{ub} unique buyers (R:{n1})"
@@ -134,6 +141,7 @@ def format_card(signal, eth_price_usd=None):
     lines.append(
         f"\n📈 *Score: {sc:.0f}*  ·  "
         f"vel {lenses.get('velocity', 0):.0f}  ·  "
+        f"turn {lenses.get('liq_turn', 0):.0f}  ·  "
         f"disp {lenses.get('dispersion', 0):.0f}  ·  "
         f"smart {lenses.get('smart_money', 0):.0f}"
     )

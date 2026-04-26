@@ -38,11 +38,23 @@ log = logging.getLogger('signal_engine')
 # are USD unless stated.  Override per-instance via SignalEngine(thresholds=...)
 DEFAULT_THRESHOLDS = {
     # ---- prefilter (cheap, GT-only) -----------------------------------
-    'min_liq_usd':            5_000,    # ~1.5 ETH
+    # Floors are scaled by FDV — see _scaled_threshold().  Listed values
+    # apply to "normal" tokens (FDV >= $1M).  Micro-caps get fractional
+    # floors so we can still catch a $17K-MC firehose like the reference.
+    'min_liq_usd':            5_000,    # ~1.5 ETH at "normal" tokens
     'min_vol_5m_usd':         3_000,
     'min_vol_1m_eth':         0.3,
     'min_unique_buyers_5m':   4,
     'velocity_ratio':         2.5,      # 1m vol >= 2.5x avg per minute over 5m
+    'min_liq_turnover_1m':    0.10,     # 10% of pool turning over in 1m
+
+    # Fresh-launch fast path: if pool age < this, prefilter only requires
+    # absolute volume + buyer count.  velocity_ratio is meaningless when
+    # the pool's been alive for 5 minutes total.
+    'fresh_launch_max_hours': 0.5,
+    'fresh_launch_min_vol_eth':    0.5,
+    'fresh_launch_min_unique_buyers': 3,
+
     # ---- safety gate (post-enrich) ------------------------------------
     'max_buy_tax_pct':        12.0,
     'max_sell_tax_pct':       12.0,
@@ -53,9 +65,29 @@ DEFAULT_THRESHOLDS = {
     'tier_elite':             85,
     'tier_hot':               70,
     'tier_notable':           55,
+    'tier_launch':            60,       # fresh-launch tag at >=60
     'min_score_to_alert':     55,
     'dedup_minutes':          240,
 }
+
+
+def _scaled_threshold(base, fdv_usd):
+    """Scale a base prefilter threshold by FDV bracket.  Tokens with tiny
+    FDV are alpha hunting grounds and need more lenient cutoffs:
+
+       FDV >= $1M      → 1.0×  (use base threshold)
+       FDV $250K - $1M → 0.7×
+       FDV $50K - $250K → 0.4×
+       FDV < $50K       → 0.2×
+
+    A $17K-MC reference token clears 0.2× of $3000 = $600 5m volume
+    instead of needing $3000.  Genuine micro-cap signal stays in.
+    """
+    fdv = float(fdv_usd or 0)
+    if fdv >= 1_000_000:  return base
+    if fdv >= 250_000:    return base * 0.7
+    if fdv >=  50_000:    return base * 0.4
+    return base * 0.2
 
 
 class SignalEngine:
@@ -124,7 +156,7 @@ class SignalEngine:
         # 8) Composite scoring + tier badge + min-score cutoff
         for r in safe:
             r['score'] = self._composite_score(r)
-            r['tier']  = self._tier(r['score'])
+            r['tier']  = self._tier(r['score'], r)
             r['lenses'] = self._lens_breakdown(r)
         safe = [r for r in safe if r['score'] >= self.thr['min_score_to_alert']]
         safe.sort(key=lambda r: -r['score'])
@@ -285,6 +317,22 @@ class SignalEngine:
         denom = max(buy_eth_5m, sell_eth_5m)
         net_buy_pressure = ((buy_eth_5m - sell_eth_5m) / denom) if denom > 0 else 0.0
 
+        # Liquidity turnover — the % of the pool that traded in 1m.  This is
+        # the actual signature of a "wake-up call": a tiny token having more
+        # than 10-20% of its liquidity turn over in a minute is on FIRE
+        # regardless of how 1m compares to 5m baseline.
+        reserve_eth = 0.0
+        try:
+            # Approximate by USD-reserve / median-trade USD-per-ETH.
+            # We don't have eth_price live here, so we use vol_5m_eth /
+            # vol_5m_usd as the implicit conversion factor.
+            if vol_5m_usd > 0 and vol_5m_eth > 0:
+                eth_per_usd = vol_5m_eth / vol_5m_usd
+                reserve_eth = (cand.get('reserve_usd') or 0) * eth_per_usd
+        except Exception:
+            reserve_eth = 0.0
+        liq_turnover_1m = (vol_1m_eth / reserve_eth) if reserve_eth > 0 else 0.0
+
         return {
             'token':            cand['token_addr'],
             'pool':             pool,
@@ -313,6 +361,8 @@ class SignalEngine:
             'sell_eth_5m':      round(sell_eth_5m, 4),
             'net_buy_pressure': round(net_buy_pressure, 3),
             'velocity_ratio':   round(velocity_ratio, 2),
+            'reserve_eth':      round(reserve_eth, 4),
+            'liq_turnover_1m':  round(liq_turnover_1m, 4),
         }
 
     # ──────────────────────────────────────────────────────────────────
@@ -394,18 +444,56 @@ class SignalEngine:
     # filters
     # ──────────────────────────────────────────────────────────────────
     def _prefilter(self, r):
-        if r['reserve_usd'] < self.thr['min_liq_usd']:
+        """Two-track prefilter:
+
+        Fresh-launch track (pool age < fresh_launch_max_hours):
+          velocity_ratio is meaningless on a 5-min-old pool (no baseline);
+          replace it with absolute volume + buyer count + liquidity-turnover
+          floor, scaled by FDV so micro-caps aren't filtered by absolute
+          dollar volume.
+
+        Established-token track:
+          full velocity_ratio + dispersion + liquidity floor, scaled
+          by FDV so a $30K MC token doesn't have to clear $3K 5m volume.
+        """
+        fdv = r.get('fdv_usd') or 0.0
+        liq_floor   = _scaled_threshold(self.thr['min_liq_usd'],   fdv)
+        vol5m_floor = _scaled_threshold(self.thr['min_vol_5m_usd'], fdv)
+        vol1m_floor = _scaled_threshold(self.thr['min_vol_1m_eth'], fdv)
+
+        if r['reserve_usd'] < liq_floor:
             return False
-        if r['vol_5m_usd'] < self.thr['min_vol_5m_usd']:
+        # Net negative pressure = sells beating buys.  Always reject.
+        if r['net_buy_pressure'] < -0.2:
             return False
-        if r['vol_1m_eth'] < self.thr['min_vol_1m_eth']:
+
+        is_fresh_launch = (0 < (r.get('pool_age_hours') or 0)
+                           < self.thr['fresh_launch_max_hours'])
+        if is_fresh_launch:
+            # Loose track — drop velocity_ratio, focus on absolute spike +
+            # liquidity turnover (which is the real signal on tiny pools).
+            if r['vol_1m_eth'] < self.thr['fresh_launch_min_vol_eth']:
+                return False
+            if r['unique_buyers_5m'] < self.thr['fresh_launch_min_unique_buyers']:
+                return False
+            if r['liq_turnover_1m'] < self.thr['min_liq_turnover_1m']:
+                return False
+            r['fresh_launch'] = True
+            return True
+
+        # Established-token track
+        if r['vol_5m_usd'] < vol5m_floor:
+            return False
+        if r['vol_1m_eth'] < vol1m_floor:
             return False
         if r['unique_buyers_5m'] < self.thr['min_unique_buyers_5m']:
             return False
-        if r['velocity_ratio'] < self.thr['velocity_ratio']:
-            return False
-        # Net negative pressure = sells beating buys.  Don't alert on dumps.
-        if r['net_buy_pressure'] < -0.2:
+        # Pass if EITHER velocity_ratio OR liq_turnover is high enough — they
+        # measure the same thing from different angles, but liq_turnover is
+        # robust on quiet-then-spike patterns where velocity_ratio is dilluted.
+        passes_vel = r['velocity_ratio'] >= self.thr['velocity_ratio']
+        passes_turnover = r['liq_turnover_1m'] >= self.thr['min_liq_turnover_1m']
+        if not (passes_vel or passes_turnover):
             return False
         return True
 
@@ -439,12 +527,17 @@ class SignalEngine:
     # 8) composite score — six lenses
     # ──────────────────────────────────────────────────────────────────
     def _composite_score(self, r):
-        """Combine six independent signal lenses into 0-100.
+        """Combine ten independent signal lenses into 0-100.
 
-        Each lens returns 0-X points; total is summed and clamped.
+        Velocity and liq_turnover both quantify "spike" but from different
+        angles — velocity vs recent baseline, turnover vs absolute pool
+        size.  Both contribute so quiet-then-spike (high velocity, low
+        turnover) and tiny-pool-firehose (low velocity, high turnover)
+        both light up.
 
-          velocity:      0-25  raw spike
-          dispersion:    0-15  unique buyers in 5m
+          velocity:      0-15  spike vs 5m baseline
+          liq_turnover:  0-15  % of pool turning over in 1m
+          dispersion:    0-10  unique buyers in 5m
           pressure:      0-10  net buy ETH pressure
           momentum:      0-10  multi-timeframe alignment
           fresh:         0-10  fresh-wallet sweet spot (20-60%)
@@ -457,47 +550,53 @@ class SignalEngine:
         """
         e = r.get('enrich') or {}
 
-        # 1) velocity (max 25)
-        vel = min(25.0, r['velocity_ratio'] * 5.0)
+        # 1) velocity (max 15) — was 25 in v1
+        vel = min(15.0, r['velocity_ratio'] * 3.0)
 
-        # 2) dispersion (max 15)
-        disp = min(15.0, r['unique_buyers_5m'] * 1.0)
+        # 2) liquidity turnover (max 15) — NEW.  Reference card token had
+        # 1m vol 3.96 ETH on a 1.9 ETH liq pool = 208% turnover in a minute.
+        # Even 30% turnover in a minute is huge, so 0.30 → 15 saturates.
+        liqt = r.get('liq_turnover_1m') or 0.0
+        liq_turn_score = min(15.0, liqt * 50.0)
 
-        # 3) net buy pressure (max 10).  pressure ∈ [-1, +1] → 0-10
+        # 3) dispersion (max 10) — was 15
+        disp = min(10.0, r['unique_buyers_5m'] * 0.7)
+
+        # 4) net buy pressure (max 10)
         pressure = max(0.0, min(10.0, (r['net_buy_pressure'] + 0.5) * 10.0))
 
-        # 4) multi-timeframe alignment (max 10).  Reward h1+h6+h24 all positive
+        # 5) multi-timeframe alignment (max 10)
         aligned = sum(1 for k in ('pct_1h', 'pct_6h', 'pct_24h')
                       if (r.get(k) or 0) > 0)
         momentum = aligned * 3.0
         if aligned == 3 and (r.get('pct_24h') or 0) > 5:
             momentum += 1.0
 
-        # 5) fresh-wallet sweet spot (max 10).  20-60% pct → full credit.
+        # 6) fresh-wallet sweet spot (max 10)
         fwp = r.get('fresh_wallet_pct') or 0.0
         if fwp == 0:
-            fresh_score = 0.0     # likely no signal collected
+            fresh_score = 0.0
         elif 20.0 <= fwp <= 60.0:
             fresh_score = 10.0
         elif fwp < 20.0:
-            fresh_score = 4.0     # quiet veteran accumulation — still ok
+            fresh_score = 4.0
         elif fwp <= 80.0:
-            fresh_score = 5.0     # leaning hot but not sybil-suspect yet
+            fresh_score = 5.0
         else:
-            fresh_score = 0.0     # 80%+ fresh = sybil farm warning
+            fresh_score = 0.0
 
-        # 6) smart-money overlap (max 15)
+        # 7) smart-money overlap (max 15)
         sm_count = r.get('smart_money_overlap') or 0
         sm = min(15.0, sm_count * 5.0)
 
-        # 7) whale count (max 5)
+        # 8) whale count (max 5)
         whale = min(5.0, (r.get('whale_count_5m') or 0) * 2.0)
 
-        # 8) pool freshness (max 5)
+        # 9) pool freshness (max 5)
         ph = r.get('pool_age_hours') or 0
-        freshness = 5.0 if (0 < ph < 24 and r['vol_5m_usd'] >= 5000) else 0.0
+        freshness = 5.0 if (0 < ph < 24 and r['vol_5m_usd'] >= 1500) else 0.0
 
-        # 9) safety bonus (max 5)
+        # 10) safety bonus (max 5)
         safety = 0.0
         bt = e.get('buy_tax') or 0.0
         st = e.get('sell_tax') or 0.0
@@ -506,17 +605,15 @@ class SignalEngine:
         if (e.get('snipers_failed') or 0) == 0: safety += 1.0
         if (e.get('risk_level') or 99) <= 1: safety += 1.0
 
-        total = (vel + disp + pressure + momentum + fresh_score
-                 + sm + whale + freshness + safety)
+        total = (vel + liq_turn_score + disp + pressure + momentum
+                 + fresh_score + sm + whale + freshness + safety)
         return round(min(100.0, max(0.0, total)), 1)
 
     def _lens_breakdown(self, r):
-        """Return per-lens scores for the formatter to render — preserves
-        debuggability without forcing the formatter to redo the math."""
-        e = r.get('enrich') or {}
         return {
-            'velocity':    round(min(25.0, r['velocity_ratio'] * 5.0), 1),
-            'dispersion':  round(min(15.0, r['unique_buyers_5m'] * 1.0), 1),
+            'velocity':    round(min(15.0, r['velocity_ratio'] * 3.0), 1),
+            'liq_turn':    round(min(15.0, (r.get('liq_turnover_1m') or 0) * 50.0), 1),
+            'dispersion':  round(min(10.0, r['unique_buyers_5m'] * 0.7), 1),
             'smart_money': round(min(15.0, (r.get('smart_money_overlap') or 0) * 5.0), 1),
             'fresh':       r.get('fresh_wallet_pct') or 0.0,
             'pressure':    r.get('net_buy_pressure') or 0.0,
@@ -524,7 +621,11 @@ class SignalEngine:
             'pool_h':      r.get('pool_age_hours') or 0,
         }
 
-    def _tier(self, score):
+    def _tier(self, score, r=None):
+        # Fresh-launch label takes priority over score tiers when the
+        # candidate came in via the fresh-launch fast path AND has signal.
+        if r and r.get('fresh_launch') and score >= self.thr['tier_launch']:
+            return '🚀 LAUNCH'
         if score >= self.thr['tier_elite']:    return '🔥🔥 ELITE'
         if score >= self.thr['tier_hot']:      return '🔥 HOT'
         if score >= self.thr['tier_notable']:  return '⚡ NOTABLE'
