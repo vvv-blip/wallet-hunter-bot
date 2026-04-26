@@ -1,17 +1,32 @@
-# Render.com Blueprint — deploys the bot as a free Web Service.
-# The bot binds an HTTP health endpoint on $PORT so Render keeps it alive
-# as long as something (UptimeRobot) pings it every <15 min.
+# Render.com Blueprint — deploys two services from this repo:
 #
-# Usage:
-#   1) Push this folder to a GitHub repo.
-#   2) render.com → New → Blueprint → connect repo → apply.
-#   3) In the service dashboard, set secrets:
-#        TELEGRAM_BOT_TOKEN = <from @BotFather>
-#        MORALIS_API_KEY    = <admin.moralis.com — primary trade-history source>
-#        ETHERSCAN_API_KEY  = <etherscan.io/v2 — optional, only for is_contract>
-#   4) Copy the public URL Render gives you (e.g. https://wallet-hunter-bot.onrender.com).
-#   5) UptimeRobot → Add New Monitor → HTTP(S) → that URL → 5-min interval.
+#   wallet-hunter-bot : original /find /scout /trending etc. wallet-research bot
+#   signal-bot        : wake-up-call signal bot — sudden volume + smart money
+#
+# Both bind a /health endpoint on $PORT so Render keeps them alive between
+# UptimeRobot pings.  They share the ETHERSCAN_API_KEY env var (independent
+# rate-limit budgets — both stay well under 5 r/s).
+#
+# After applying the Blueprint, set the per-service secrets in each dashboard:
+#
+#   wallet-hunter-bot:
+#     TELEGRAM_BOT_TOKEN = <wallet bot token>
+#     ETHERSCAN_API_KEY  = <etherscan.io/v2 key>
+#     MORALIS_API_KEY    = (optional — only used if WALLET_BOT_USE_MORALIS=1)
+#
+#   signal-bot:
+#     SIGNAL_BOT_TOKEN     = <signal bot token from @BotFather>
+#     ETHERSCAN_API_KEY    = <same key — separate quota>
+#     SIGNAL_BROADCAST_TO  = <optional comma-separated chat IDs for durable
+#                             broadcast that survives subscriber-file resets>
+#
+# Then for each service, register a UptimeRobot monitor (HTTP, 5-min interval)
+# at the public URL Render assigns.
+
 services:
+  # ────────────────────────────────────────────────────────────────────
+  # 1) Wallet-hunter bot (legacy + new discovery commands)
+  # ────────────────────────────────────────────────────────────────────
   - type: web
     name: wallet-hunter-bot
     runtime: python
@@ -20,14 +35,37 @@ services:
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false      # set manually in Render dashboard
-      - key: MORALIS_API_KEY
         sync: false
       - key: ETHERSCAN_API_KEY
         sync: false
+      - key: MORALIS_API_KEY
+        sync: false      # optional — only used if WALLET_BOT_USE_MORALIS=1
       - key: PYTHON_VERSION
         value: "3.12.5"
       - key: BOT_CACHE_DIR
         value: /tmp/cache
+    healthCheckPath: /
+    autoDeploy: true
+
+  # ────────────────────────────────────────────────────────────────────
+  # 2) Signal bot (wake-up-call alerts)
+  # ────────────────────────────────────────────────────────────────────
+  - type: web
+    name: signal-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python signal_bot.py
+    envVars:
+      - key: SIGNAL_BOT_TOKEN
+        sync: false      # set manually in Render dashboard
+      - key: ETHERSCAN_API_KEY
+        sync: false
+      - key: SIGNAL_BROADCAST_TO
+        sync: false      # optional
+      - key: SIGNAL_SCAN_SECONDS
+        value: "60"
+      - key: PYTHON_VERSION
+        value: "3.12.5"
     healthCheckPath: /
     autoDeploy: true
