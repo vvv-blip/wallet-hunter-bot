@@ -113,6 +113,8 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/find 0xTOKEN 0.5 2.3` — wallets that bought 0.5 ETH, sold 2.3 ETH (±5%)\n"
         "`/findsmart 0xTOKEN 0.5 2.3` — same as /find, but only *quality-scored* "
         "wallets (real humans, not bots)\n\n"
+        "*Discover hot tokens:*\n"
+        "`/trending [N]` — top N trending tokens with price change + volume\n\n"
         "*Discover top traders on a token:*\n"
         "`/topwallets 0xTOKEN` — leaderboard by total PnL (realized + unrealized)\n"
         "`/earlybuyers 0xTOKEN` — first wallets to ever buy this token\n"
@@ -780,6 +782,63 @@ async def findsmart_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                            disable_web_page_preview=True)
 
 
+async def trending_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Trending tokens on Ethereum mainnet (per GeckoTerminal)."""
+    args = ctx.args
+    n = 12
+    if args:
+        try: n = max(1, min(20, int(args[0])))
+        except: pass
+
+    status = await update.message.reply_text(
+        f"📈 Loading top {n} trending tokens…"
+    )
+    loop = asyncio.get_running_loop()
+    try:
+        results = await loop.run_in_executor(
+            None, lambda: _gt.trending_pools(n=n))
+    except Exception as e:
+        log.exception("trending error")
+        await status.edit_text(f"❌ Error: {html.escape(str(e)[:200])}")
+        return
+
+    if not results:
+        await status.edit_text("❌ No trending data returned.")
+        return
+
+    def _fmt_usd(x):
+        if x >= 1e9:  return f"${x/1e9:.2f}B"
+        if x >= 1e6:  return f"${x/1e6:.2f}M"
+        if x >= 1e3:  return f"${x/1e3:.1f}k"
+        return f"${x:.0f}"
+
+    def _fmt_pct(x):
+        if x is None:
+            return ' n/a '
+        prefix = '+' if x >= 0 else ''
+        return f"{prefix}{x:.1f}%"
+
+    lines = ["📈 *Trending tokens* (Ethereum, last 24h)", ""]
+    for i, r in enumerate(results, 1):
+        net_buyers = r['buyers_24h'] - r['sellers_24h']
+        net_emoji = '🟢' if net_buyers >= 0 else '🔴'
+        lines.append(
+            f"*#{i}* `{r['token_addr']}` *{html.escape(r['symbol'])}*\n"
+            f"   24h: {_fmt_pct(r['pct_24h'])} · "
+            f"6h: {_fmt_pct(r['pct_6h'])} · "
+            f"1h: {_fmt_pct(r['pct_1h'])}\n"
+            f"   vol: {_fmt_usd(r['volume_24h_usd'])} · "
+            f"fdv: {_fmt_usd(r['fdv_usd'])} · "
+            f"liq: {_fmt_usd(r['reserve_usd'])}\n"
+            f"   {net_emoji} {r['buyers_24h']} buyers / {r['sellers_24h']} sellers"
+        )
+    lines.append("")
+    lines.append("_drill in with `/topwallets <ca>` or `/insider <ca>`_")
+    await status.edit_text("\n".join(lines)[:4000],
+                           parse_mode=ParseMode.MARKDOWN,
+                           disable_web_page_preview=True)
+
+
 async def topwallets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Top traders by realized PnL on a token."""
     args = ctx.args
@@ -1369,6 +1428,7 @@ def main():
     app.add_handler(CommandHandler('clearcache', clearcache_cmd))
 
     # Smart-wallet discovery + quality scoring commands (new)
+    app.add_handler(CommandHandler('trending', trending_cmd))
     app.add_handler(CommandHandler('profile', profile_cmd))
     app.add_handler(CommandHandler('findsmart', findsmart_cmd))
     app.add_handler(CommandHandler('topwallets', topwallets_cmd))

@@ -240,6 +240,63 @@ class GTSource:
             self.cache.set(ck, out)
         return out
 
+    def trending_pools(self, network='eth', n=20, ttl=120):
+        """Top trending pools per GT.  Each row exposes the underlying token
+        address plus market metrics (price-change, volume, FDV, reserves).
+        Cache short (2 min) — trending data is most useful when fresh.
+        """
+        ck = f'gt_trending_{network}_n{n}'
+        cached = self.cache.get(ck, ttl=ttl)
+        if cached is not None:
+            return cached
+        out = []
+        page = 1
+        while len(out) < n and page <= 3:
+            j = self._req(f'/networks/{network}/trending_pools',
+                          params={'page': page})
+            rows = (j.get('data') or []) if isinstance(j, dict) else []
+            if not rows:
+                break
+            for row in rows:
+                attr = row.get('attributes') or {}
+                rel = row.get('relationships') or {}
+                base = ((rel.get('base_token') or {}).get('data') or {})
+                # base.id is e.g. "eth_0xabc...";  strip prefix
+                bid = base.get('id') or ''
+                token_addr = bid.split('_', 1)[-1].lower()
+                if not token_addr.startswith('0x'):
+                    continue
+                pct = attr.get('price_change_percentage') or {}
+                vol = attr.get('volume_usd') or {}
+                txc = attr.get('transactions') or {}
+                tx_h24 = txc.get('h24') or {}
+                # parts of `name` are usually "TOKEN / WETH" — extract symbol
+                name = attr.get('name') or ''
+                symbol = name.split('/')[0].strip() if '/' in name else name
+                out.append({
+                    'pool_addr':       (attr.get('address') or '').lower(),
+                    'token_addr':      token_addr,
+                    'name':            name,
+                    'symbol':          symbol[:24],
+                    'price_usd':       float(attr.get('base_token_price_usd') or 0),
+                    'pct_1h':          float(pct.get('h1') or 0),
+                    'pct_6h':          float(pct.get('h6') or 0),
+                    'pct_24h':         float(pct.get('h24') or 0),
+                    'volume_24h_usd':  float(vol.get('h24') or 0),
+                    'fdv_usd':         float(attr.get('fdv_usd') or 0),
+                    'reserve_usd':     float(attr.get('reserve_in_usd') or 0),
+                    'buys_24h':        int(tx_h24.get('buys') or 0),
+                    'sells_24h':       int(tx_h24.get('sells') or 0),
+                    'buyers_24h':      int(tx_h24.get('buyers') or 0),
+                    'sellers_24h':     int(tx_h24.get('sellers') or 0),
+                })
+                if len(out) >= n:
+                    break
+            page += 1
+        if out:
+            self.cache.set(ck, out)
+        return out
+
     def token_trades(self, token, network='eth', n_pools=15, max_workers=8):
         """All recent trades for a token, aggregated across the top N pools.
         Deduped on tx_hash, sorted by ts desc."""
