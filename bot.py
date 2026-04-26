@@ -114,7 +114,7 @@ async def start_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "`/findsmart 0xTOKEN 0.5 2.3` — same as /find, but only *quality-scored* "
         "wallets (real humans, not bots)\n\n"
         "*Discover top traders on a token:*\n"
-        "`/topwallets 0xTOKEN` — leaderboard by realized PnL\n"
+        "`/topwallets 0xTOKEN` — leaderboard by total PnL (realized + unrealized)\n"
         "`/earlybuyers 0xTOKEN` — first wallets to ever buy this token\n"
         "`/diamondhands 0xTOKEN` — bought and held 14+ days\n"
         "`/prepump 0xTOKEN` — wallets that bought *before* the first 5x pump\n"
@@ -813,19 +813,32 @@ async def topwallets_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     eth_price = get_eth_price_usd()
     lines = [
         f"🏆 *Top traders by PnL* — `{fmt_short(token)}`",
-        f"_(realized — visible recent trades only)_",
+        f"_(realized + unrealized, mark-to-market at median sample price)_",
         "",
     ]
     for i, r in enumerate(results, 1):
-        pnl = r['pnl_eth']
+        # Tolerate both old-shape ('pnl_eth' only) and new-shape rows.
+        realized = r.get('pnl_realized_eth')
+        unrealized = r.get('pnl_unrealized_eth')
+        total = r.get('pnl_total_eth', r.get('pnl_eth', 0.0))
         roi = r.get('roi', 0) * 100
-        lines.append(
+        # Body rows
+        body = (
             f"*#{i}*  `{r['wallet']}`\n"
             f"   in: {r['eth_in']:.3f} ETH ({r['n_buys']}×) · "
             f"out: {r['eth_out']:.3f} ETH ({r['n_sells']}×)\n"
-            f"   pnl: {pnl:+.3f} ETH (${pnl*eth_price:+,.0f}, {roi:+.0f}%)\n"
+        )
+        if realized is not None and unrealized is not None:
+            body += (
+                f"   realized: {realized:+.3f} · "
+                f"unrealized: {unrealized:+.3f}\n"
+            )
+        body += (
+            f"   *total: {total:+.3f} ETH* "
+            f"(${total*eth_price:+,.0f}, {roi:+.0f}%)\n"
             f"   [etherscan](https://etherscan.io/address/{r['wallet']})"
         )
+        lines.append(body)
     await status.edit_text("\n".join(lines)[:4000],
                            parse_mode=ParseMode.MARKDOWN,
                            disable_web_page_preview=True)

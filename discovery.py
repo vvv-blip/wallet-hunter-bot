@@ -97,14 +97,21 @@ class Discovery:
     # 1) top_traders_by_pnl
     # ──────────────────────────────────────────────────────────────────────
     def top_traders_by_pnl(self, token, top_n=20, network='eth'):
-        """Highest realized PnL traders on a token, computed live from GT.
+        """Highest total-PnL traders on a token (realized + unrealized).
+
+        Diamond hands look like losers when ranked on `eth_out - eth_in`
+        alone — they bought but haven't sold yet.  We mark-to-market the
+        net token holdings using a robust median price-per-token from the
+        same GT trade window, so a wallet that bought 10 ETH worth and
+        still holds it at 2x reads as +10 ETH unrealized, not -10 realized.
 
         Inputs:  token (address), top_n, network
-        Outputs: list[{wallet, eth_in, eth_out, pnl_eth, roi,
-                       n_buys, n_sells, first_ts, last_ts}]
+        Outputs: list[{wallet, eth_in, eth_out, net_tokens,
+                       pnl_realized_eth, pnl_unrealized_eth, pnl_total_eth,
+                       roi, n_buys, n_sells, first_ts, last_ts}]
         Time budget: ~5-15s (GT only).  Cache 5 min per token.
         """
-        ck = f'disc_pnl_{network}_{token.lower()}_n{top_n}'
+        ck = f'disc_pnl2_{network}_{token.lower()}_n{top_n}'
         cached = self.cache.get(ck, ttl=300)
         if cached is not None:
             return cached
@@ -114,6 +121,20 @@ class Discovery:
         except Exception:
             trades = []
 
+        # Median price-per-token in ETH from the trade sample.  Using the
+        # median makes us robust against single-tx outliers (sandwich attacks,
+        # tiny dust trades that distort price/token).  Computed BEFORE
+        # aggregation so we have a single mark-to-market price per token.
+        eth_per_token_samples = []
+        for tr in trades:
+            eth = self._safe_float(tr.get('eth'))
+            tok = self._safe_float(tr.get('token_amt'))
+            if eth > 0 and tok > 0:
+                eth_per_token_samples.append(eth / tok)
+        eth_per_token = (sorted(eth_per_token_samples)
+                         [len(eth_per_token_samples) // 2]
+                         if eth_per_token_samples else 0.0)
+
         agg = {}
         for tr in trades:
             w = (tr.get('wallet') or '').lower()
@@ -121,18 +142,22 @@ class Discovery:
                 continue
             kind = tr.get('kind') or ''
             eth = self._safe_float(tr.get('eth'))
+            tok = self._safe_float(tr.get('token_amt'))
             ts = self._safe_int(tr.get('ts'))
             d = agg.get(w)
             if d is None:
                 d = {'eth_in': 0.0, 'eth_out': 0.0,
+                     'tokens_bought': 0.0, 'tokens_sold': 0.0,
                      'n_buys': 0, 'n_sells': 0,
                      'first_ts': ts or 0, 'last_ts': ts or 0}
                 agg[w] = d
             if kind == 'buy':
                 d['eth_in'] += eth
+                d['tokens_bought'] += tok
                 d['n_buys'] += 1
             elif kind == 'sell':
                 d['eth_out'] += eth
+                d['tokens_sold'] += tok
                 d['n_sells'] += 1
             if ts:
                 if d['first_ts'] == 0 or ts < d['first_ts']:
@@ -144,20 +169,37 @@ class Discovery:
         for w, d in agg.items():
             if d['eth_in'] == 0.0 and d['eth_out'] == 0.0:
                 continue
-            pnl = d['eth_out'] - d['eth_in']
-            roi = pnl / max(d['eth_in'], 0.0001)
+            # GT trade window is finite (~300 trades/pool, recent only).  If we
+            # observed a wallet's sells but not their buys, eth_in=0 and the
+            # apparent realized PnL is meaningless free money — they paid for
+            # the tokens earlier in unrecorded history.  Drop these from the
+            # leaderboard so a real diamond-hand (eth_out=0, eth_in>0) ranks
+            # correctly while a missing-cost-basis seller doesn't pollute it.
+            if d['eth_in'] == 0.0 and d['eth_out'] > 0.0:
+                continue
+            net_tokens = max(0.0, d['tokens_bought'] - d['tokens_sold'])
+            pnl_realized = d['eth_out'] - d['eth_in']
+            pnl_unrealized = net_tokens * eth_per_token
+            pnl_total = pnl_realized + pnl_unrealized
+            # ROI uses total invested (eth_in) as cost basis
+            roi = pnl_total / max(d['eth_in'], 0.0001)
             out.append({
                 'wallet': w,
                 'eth_in': d['eth_in'],
                 'eth_out': d['eth_out'],
-                'pnl_eth': pnl,
+                'net_tokens': net_tokens,
+                'pnl_realized_eth': pnl_realized,
+                'pnl_unrealized_eth': pnl_unrealized,
+                'pnl_total_eth': pnl_total,
+                # Keep `pnl_eth` for backward-compat (old callers / cached UI):
+                'pnl_eth': pnl_total,
                 'roi': roi,
                 'n_buys': d['n_buys'],
                 'n_sells': d['n_sells'],
                 'first_ts': d['first_ts'],
                 'last_ts': d['last_ts'],
             })
-        out.sort(key=lambda x: -x['pnl_eth'])
+        out.sort(key=lambda x: -x['pnl_total_eth'])
         out = out[:top_n]
         if out:
             self.cache.set(ck, out)
